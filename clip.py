@@ -199,8 +199,13 @@ def groq_chat(messages, key, json_mode=True):
 def download(url, workdir):
     out = workdir / "source.mp4"
     print("[1/4] telechargement...")
-    run(["yt-dlp", "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
-         "--no-playlist", "-o", str(out), url])
+    cmd = ["yt-dlp", "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+           "--no-playlist", "-o", str(out), url]
+    # sur un serveur, YouTube exige des cookies d'un compte connecte
+    cookies = os.environ.get("YT_COOKIES_FILE")
+    if cookies and pathlib.Path(cookies).exists():
+        cmd[1:1] = ["--cookies", cookies]
+    run(cmd)
     if not out.exists():  # yt-dlp peut suffixer l'extension
         cands = list(workdir.glob("source.*"))
         if cands:

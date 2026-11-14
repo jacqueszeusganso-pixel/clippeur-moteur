@@ -27,10 +27,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: denoland/setup-deno@v2
       - name: Outils
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          pip install -q yt-dlp opencv-python-headless numpy
+          pip install -q -U "yt-dlp[default]" opencv-python-headless numpy
+      - name: Cookies YouTube
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then
+            printf '%s\n' "$YT_COOKIES" > "$RUNNER_TEMP/cookies.txt"
+            echo "YT_COOKIES_FILE=$RUNNER_TEMP/cookies.txt" >> "$GITHUB_ENV"
+          fi
       - name: Verifier les entrees
         env:
           N: ${{ inputs.clips }}
