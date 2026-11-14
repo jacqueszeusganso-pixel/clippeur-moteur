@@ -1,3 +1,4 @@
+# Moteur du clippeur maison : lien video -> shorts publies en release
 name: clip
 run-name: clip ${{ inputs.job_id }}
 
