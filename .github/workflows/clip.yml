@@ -1,0 +1,55 @@
+name: clip
+run-name: clip ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Lien de la video
+        required: true
+      clips:
+        description: Nombre de shorts
+        default: "3"
+      job_id:
+        description: Identifiant du travail
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Outils
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q yt-dlp opencv-python-headless numpy
+      - name: Verifier les entrees
+        env:
+          N: ${{ inputs.clips }}
+          JOB: ${{ inputs.job_id }}
+          URL: ${{ inputs.url }}
+        run: |
+          [[ "$N" =~ ^[1-6]$ ]] || { echo "clips invalide"; exit 1; }
+          [[ "$JOB" =~ ^[A-Za-z0-9-]{4,40}$ ]] || { echo "job_id invalide"; exit 1; }
+          [[ "$URL" =~ ^https?:// ]] || { echo "url invalide"; exit 1; }
+      - name: Clipper
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          URL: ${{ inputs.url }}
+          N: ${{ inputs.clips }}
+        run: python clip.py "$URL" --clips "$N" --out sorties
+      - name: Publier les shorts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          d=$(ls -d sorties/video_* | head -1)
+          gh release create "job-$JOB" "$d"/*.mp4 "$d"/*.txt "$d"/shorts.json \
+            --title "job $JOB" --notes "Shorts generes" --prerelease
