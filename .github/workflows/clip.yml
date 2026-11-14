@@ -11,6 +11,9 @@ on:
       clips:
         description: Nombre de shorts
         default: "3"
+      opts:
+        description: Reglages JSON (format, cat, cut, title, find, start, end)
+        default: "{}"
 
 permissions:
   contents: write
@@ -18,11 +21,12 @@ permissions:
 jobs:
   clip:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
       JOB: ${{ inputs.job_id }}
       N: ${{ inputs.clips }}
+      OPTS: ${{ inputs.opts }}
     steps:
       - name: Verifier les entrees
         run: |
@@ -39,12 +43,13 @@ jobs:
       - name: Recuperer la video
         run: |
           gh release download "job-$JOB" -p 'part_*' -D parts
-          cat parts/part_* > input.mp4
+          cat parts/part_* > input.mp4 && rm -rf parts
           ls -lh input.mp4
       - name: Clipper
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python clip.py input.mp4 --clips "$N" --out sorties
+        # OPTS est relu et valide par clip.py (parse_opts), jamais interprete par le shell
+        run: python clip.py input.mp4 --clips "$N" --opts "$OPTS" --out sorties
       - name: Publier les shorts
         run: |
           d=$(ls -d sorties/video_* | head -1)
