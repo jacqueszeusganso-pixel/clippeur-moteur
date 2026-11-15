@@ -47,6 +47,9 @@ CATS = {
 }
 MAX_RANGE = 3600  # une heure max par passage (quota audio Groq gratuit)
 LAYOUTS = ("auto", "full", "split")
+ACCENT = "#FF4322"  # orange maison, couleur par defaut du titre
+HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+MAX_KEYS = 40
 SPLIT_TOP = 0.4  # ecran partage : part de la hauteur donnee a la facecam
 EDGE = 5.0  # marge gardee autour de chaque extrait brut, pour l'allonger a l'edition
 
@@ -599,8 +602,19 @@ def ass_text(s):
             .replace("\n", " ").strip())
 
 
+def ass_color(hexc):
+    """#RRGGBB -> &H00BBGGRR (ordre ASS)."""
+    return f"&H00{hexc[5:7]}{hexc[3:5]}{hexc[1:3]}".upper()
+
+
+def ink_on(hexc):
+    """Texte noir sur fond clair, blanc sur fond fonce."""
+    r, g, b = (int(hexc[i:i + 2], 16) for i in (1, 3, 5))
+    return "#0A0A0B" if .299 * r + .587 * g + .114 * b > 140 else "#FFFFFF"
+
+
 def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None,
-              subs=True):
+              subs=True, color=ACCENT, subc="#FFFFFF"):
     """Sous-titres ASS : groupes de mots gros et centres, titre en haut si demande.
     `segs` = morceaux gardes de la source ; les temps sont recales dessus."""
     W, H, fs = FORMATS[fmt]
@@ -609,10 +623,10 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, "
         "Bold, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n"
-        f"Style: Pop,Arial Black,{fs},&H00FFFFFF,&H00000000,&H00000000,"
+        f"Style: Pop,Arial Black,{fs},{ass_color(subc)},&H00000000,&H00000000,"
         f"-1,1,6,2,2,80,80,{round(H * .135) if margin_v is None else margin_v}\n"
-        # titre : texte noir sur bandeau orange (BorderStyle 3 = boite opaque)
-        f"Style: Title,Arial Black,{round(fs * .62)},&H000B0A0A,&H002243FF,&H00000000,"
+        # titre : texte sur bandeau de couleur (BorderStyle 3 = boite opaque)
+        f"Style: Title,Arial Black,{round(fs * .62)},{ass_color(ink_on(color))},{ass_color(color)},&H00000000,"
         f"-1,3,14,0,8,90,90,{round(H * .07)}\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -707,7 +721,39 @@ def parse_spec(d, dur):
         "subs": d.get("subs", True) is not False,
         "title": ass_text(str(d.get("title") or ""))[:100],
         "ask": re.sub(r"\s+", " ", str(d.get("ask") or ""))[:300].strip(),
+        "color": d["color"].upper() if HEX_RE.match(str(d.get("color") or "")) else ACCENT,
+        "subc": d["subc"].upper() if HEX_RE.match(str(d.get("subc") or "")) else "#FFFFFF",
+        "keys": parse_keys(d.get("keys"), dur, rect),
     }
+
+
+def parse_keys(keys, dur, rect):
+    """Cadrages valides a la main a un moment : chacun vaut jusqu'au suivant."""
+    out = {}
+    for k in keys if isinstance(keys, list) else []:
+        try:
+            t = round(float(k["t"]), 2)
+        except (KeyError, TypeError, ValueError):
+            continue
+        r = {n: rect(k.get(n)) for n in ("crop", "cam", "game")}
+        if 0 <= t <= dur and any(r.values()):
+            out[t] = {"t": t, **{n: v for n, v in r.items() if v}}
+    return [out[t] for t in sorted(out)][:MAX_KEYS]
+
+
+def plans(spec):
+    """Decoupe le short en plans [(debut, fin, cadres)] en temps du short (0 = debut de coupe)."""
+    s0, s1 = spec["trim"]
+    cur = {n: spec[n] for n in ("crop", "cam", "game")}
+    out = [[s0, cur]]
+    for k in spec.get("keys") or []:
+        r = {**out[-1][1], **{n: k[n] for n in ("crop", "cam", "game") if k.get(n)}}
+        if k["t"] <= s0 + .05:
+            out[-1][1] = r
+        elif k["t"] < s1 - .05:
+            out.append([k["t"], r])
+    return [(round(a - s0, 3), round((out[i + 1][0] if i + 1 < len(out) else s1) - s0, 3), r)
+            for i, (a, r) in enumerate(out)]
 
 
 def auto_spec(samples, opts, iw, ih, s0, s1, title):
@@ -726,6 +772,7 @@ def auto_spec(samples, opts, iw, ih, s0, s1, title):
         "game": norm_rect(compute_crop(iw, ih, 0.5, 0.5, W / hb), iw, ih),
         "track": bool(faces), "trim": [round(s0, 2), round(s1, 2)],
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
+        "color": ACCENT, "subc": "#FFFFFF", "keys": [],
     }
 
 
@@ -742,11 +789,37 @@ def render_spec(raw, words, spec, out, samples=None):
         pre = f"select='{sel}',setpts=N/FRAME_RATE/TB,"
         af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
     split = spec["layout"] == "split" and spec["cam"] and spec["game"] and spec["format"] in ("9:16", "4:5")
-    if split:
+    look = {"color": spec.get("color", ACCENT), "subc": spec.get("subc", "#FFFFFF")}
+    cuts = plans(spec)
+    if len(cuts) > 1:  # cadrages valides moment par moment : un plan chacun, mis bout a bout
+        ht, hb = split_heights(H)
+        build_ass(words, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look,
+                  margin_v=hb - round(fs * .5) if split else None)
+
+        def box(r, ratio):
+            return rect_px(r, iw, ih, ratio) if r else compute_crop(iw, ih, 0.5, 0.5, ratio)
+        graph = [f"[0:v]split={len(cuts)}" + "".join(f"[s{i}]" for i in range(len(cuts)))]
+        for i, (a, b, r) in enumerate(cuts):
+            head = f"[s{i}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,"
+            if split:
+                cw, ch, cx, cy = box(r["cam"], W / ht)
+                gw, gh, gx, gy = box(r["game"], W / hb)
+                graph.append(f"{head}split=2[a{i}][b{i}];"
+                             f"[a{i}]crop={cw}:{ch}:{cx}:{cy},scale={W}:{ht},setsar=1[t{i}];"
+                             f"[b{i}]crop={gw}:{gh}:{gx}:{gy},scale={W}:{hb},setsar=1[u{i}];"
+                             f"[t{i}][u{i}]vstack[p{i}]")
+            else:
+                cw, ch, x, y = box(r["crop"], W / H)
+                graph.append(f"{head}crop={cw}:{ch}:{x}:{y},scale={W}:{H},setsar=1[p{i}]")
+        graph.append("".join(f"[p{i}]" for i in range(len(cuts)))
+                     + f"concat=n={len(cuts)}:v=1:a=0,{pre}subtitles={subs.name}[v]")
+        vargs = ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "0:a?"]
+        print(f"    {len(cuts)} cadrages choisis a la main")
+    elif split:
         ht, hb = split_heights(H)
         # sous-titres a cheval sur la jonction des deux panneaux
         build_ass(words, segs, subs, spec["format"], spec["title"],
-                  margin_v=hb - round(fs * .5), subs=spec["subs"])
+                  margin_v=hb - round(fs * .5), subs=spec["subs"], **look)
         fw_, fh_, fx, fy = rect_px(spec["cam"], iw, ih, W / ht)
         gw, gh, gx, gy = rect_px(spec["game"], iw, ih, W / hb)
         graph = (f"[0:v]{pre}split=2[a][b];"
@@ -755,7 +828,7 @@ def render_spec(raw, words, spec, out, samples=None):
                  f"[top][bot]vstack,subtitles={subs.name}[v]")
         vargs = ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
     else:
-        build_ass(words, segs, subs, spec["format"], spec["title"], subs=spec["subs"])
+        build_ass(words, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look)
         if spec["track"] and samples:
             cw, ch, _, _ = compute_crop(iw, ih, 0.5, 0.5, W / H)
             x, y = track_crop(samples, segs, iw, ih, cw, ch)
@@ -839,7 +912,7 @@ def edit_main(args):
     if spec["ask"]:
         spec = parse_spec(ask_edit(spec, words, dur, load_groq_key()), dur)
     samples = None
-    if spec["track"] and spec["layout"] == "full":
+    if spec["track"] and spec["layout"] == "full" and not spec["keys"]:
         samples = face_samples(raw, *spec["trim"])
     out = pathlib.Path(args.edit_out)
     render_spec(raw, words, spec, out, samples)
@@ -998,6 +1071,17 @@ def selfcheck():
     assert a["layout"] == "split" and a["track"] and a["trim"] == [3, 20], a
     assert all(0 <= a["game"][k] <= 1 for k in "xywh"), a
     assert parse_spec(a, 30)["cam"] == a["cam"]  # ce que le moteur ecrit, l'editeur le relit
+    # couleurs et cadrages moment par moment
+    r1, r2 = {"x": .1, "y": 0, "w": .3, "h": 1}, {"x": .6, "y": 0, "w": .3, "h": 1}
+    k = parse_spec({"trim": [2, 12], "crop": r1, "color": "#ffd60a", "subc": "rouge",
+                    "keys": [{"t": 7, "crop": r2}, {"t": 2, "crop": r2}, {"t": "x"}, {"t": 5}]}, dur=20)
+    assert k["color"] == "#FFD60A" and k["subc"] == "#FFFFFF", k
+    assert [x["t"] for x in k["keys"]] == [2, 7], k["keys"]
+    assert plans(k) == [(0, 5, {"crop": r2, "cam": None, "game": None}),
+                        (5, 10, {"crop": r2, "cam": None, "game": None})], plans(k)
+    k["keys"] = [{"t": 6, "crop": r2}]
+    assert [(a, b, r["crop"]["x"]) for a, b, r in plans(k)] == [(0, 4, .1), (4, 10, .6)]
+    assert ass_color("#FF4322") == "&H002243FF" and ink_on("#FFD60A") == "#0A0A0B" and ink_on("#111111") == "#FFFFFF"
     ch = chunk_lines("aaaaaa\nbbbbbb\ncccccc", size=15)
     assert ch == ["aaaaaa\nbbbbbb\n", "cccccc\n"], ch
     cl = [{"start": 0, "end": 30, "score": 70}, {"start": 20, "end": 50, "score": 90},
