@@ -441,6 +441,10 @@ def transcript_lines(words, group=10):
 # Offre gratuite Groq : 8000 jetons par minute, question et reponse comprises. Une demi-heure
 # de parole depasse ca (erreur 413) : on envoie la transcription par tranches.
 CHUNK_CHARS = 11000  # ~3500 jetons de transcription par appel
+# Choix de Jacques (2026-11-15) : tout ce qui est publie est en anglais, quelle que soit la
+# langue de la video. Consigne en anglais : en francais, le modele repondait parfois en francais.
+ENGLISH = ("IMPORTANT: write every title, caption and hashtag in ENGLISH, even if the video "
+           "is in French or any other language. Never answer in French.")
 
 
 def chunk_lines(text, size=CHUNK_CHARS):
@@ -510,16 +514,16 @@ def select_in(transcript, total, key, n, cat, find, partial):
         '\"hashtags\":[\"<4 a 6 hashtags pertinents>\"]}]}\n'
         "Regles : chaque extrait dure entre 15 et 60 secondes, start et end sont des "
         "nombres en secondes pris dans la video, les extraits ne se chevauchent pas, "
-        "tries du meilleur score au moins bon. Titre, legende et hashtags dans la "
-        "langue de la video, sans aucun emoji. Rien d'autre que le JSON.")
+        "tries du meilleur score au moins bon. Sans aucun emoji. Rien d'autre que le JSON.\n"
+        + ENGLISH)
     if CATS.get(cat):
         user_msg += "\n\nContexte : " + CATS[cat]
     if find:
         user_msg += ("\n\nLe spectateur cherche un moment precis : \u00ab " + find + " \u00bb. "
                      "Ne retiens que des extraits qui y correspondent, du plus probable au "
                      "moins probable (le score dit a quel point ca correspond). S'il n'y a "
-                     "pas de correspondance exacte, donne les passages les plus proches. "
-                     "Titre, legende et hashtags restent dans la langue de la video.")
+                     "pas de correspondance exacte, donne les passages les plus proches.\n"
+                     + ENGLISH)
     raw = chat_retry([{"role": "system", "content": sys_msg},
                       {"role": "user", "content": user_msg}], key)
     clips = parse_clips(raw, total)
@@ -553,8 +557,10 @@ def parse_clips(raw, total):
         if not (2 <= end - start <= 120):  # garde-fou duree
             continue
         tags = c.get("hashtags")
-        if isinstance(tags, list):
-            tags = " ".join(str(t).strip() for t in tags)
+        if isinstance(tags, str):
+            tags = tags.split()
+        if isinstance(tags, list):  # "#" garanti, espaces internes retires : pret a publier
+            tags = " ".join("#" + re.sub(r"[\s#]+", "", str(t)) for t in tags if str(t).strip("# "))
         out.append({
             "start": start, "end": end,
             "title": str(c.get("title", "Short"))[:80],
@@ -801,7 +807,7 @@ def ask_edit(spec, words, dur, key):
         f"Demande du monteur : \u00ab {spec['ask']} \u00bb\n\n"
         'Reponds STRICTEMENT en JSON : {"changes": {...}} avec seulement les cles a modifier '
         "parmi trim, title, cut, subs, format (9:16, 4:5, 1:1, 16:9) et layout (full ou split). "
-        "Le titre reste dans la langue de la video, sans emoji.")
+        "Sans emoji.\n" + ENGLISH)
     try:
         raw = groq_chat([{"role": "system", "content": "Tu es monteur de shorts. Tu ne reponds qu'en JSON."},
                          {"role": "user", "content": msg}], key)
