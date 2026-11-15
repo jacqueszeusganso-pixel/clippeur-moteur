@@ -50,6 +50,7 @@ LAYOUTS = ("auto", "full", "split")
 ACCENT = "#FF4322"  # orange maison, couleur par defaut du titre
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 MAX_KEYS = 40
+DUR_MIN, DUR_MAX = 40, 90  # bornes du reglage "duree des shorts", en secondes
 SPLIT_TOP = 0.4  # ecran partage : part de la hauteur donnee a la facecam
 EDGE = 5.0  # marge gardee autour de chaque extrait brut, pour l'allonger a l'edition
 
@@ -135,7 +136,15 @@ def parse_opts(raw):
         "layout": d.get("layout") if d.get("layout") in LAYOUTS else "auto",
         "find": re.sub(r"\s+", " ", str(d.get("find") or ""))[:200].strip(),
         "start": None, "end": None,
+        "dmin": DUR_MIN, "dmax": DUR_MAX, "loop": d.get("loop", True) is not False,
     }
+    try:
+        a, b = int(float(d["dmin"])), int(float(d["dmax"]))
+        a, b = max(DUR_MIN, min(a, DUR_MAX)), max(DUR_MIN, min(b, DUR_MAX))
+        if b - a >= 5:
+            o["dmin"], o["dmax"] = a, b
+    except (KeyError, TypeError, ValueError):
+        pass
     try:
         a, b = float(d["start"]), float(d["end"])
         if 0 <= a < b <= 86400 and b - a <= MAX_RANGE:
@@ -486,7 +495,57 @@ def best_distinct(clips, n):
     return out[:n]
 
 
-def select_clips(words, key, n, cat="auto", find=""):
+def kept(words, a, b, cut):
+    """Duree finale d'un extrait, blancs retires si demande."""
+    return sum(y - x for x, y in keep_segments(words, a, b)) if cut else b - a
+
+
+def norm_word(w):
+    return re.sub(r"[^\w']", "", str(w).lower())
+
+
+def fit_clip(clip, words, opts):
+    """Cale un extrait sur les mots : debut sur un mot, fin sur la fin d'un mot, duree
+    finale dans [dmin, dmax]. En boucle, la fin prefere le moment ou la phrase continue
+    (pas de blanc) et, mieux, celui ou le mot suivant est le premier mot du short :
+    la derniere image s'enchaine sur la premiere."""
+    dmin, dmax, cut = opts["dmin"], opts["dmax"], opts["cut"]
+    ws = [w for w in words if float(w["end"]) > clip["start"] - .3]
+    if not ws:
+        return clip
+    i0 = 0
+    start = max(0.0, float(ws[i0]["start"]) - .05)
+    first = norm_word(ws[i0]["word"])
+    ws = words = [w for w in ws if float(w["start"]) < start + dmax + 5]  # fenetre utile seulement
+    best, best_sc = None, None
+    for i, w in enumerate(ws[i0:], i0):
+        e = float(w["end"])
+        d = kept(words, start, e + .08, cut)
+        if d > dmax:
+            break
+        if d < dmin:
+            continue
+        nxt = ws[i + 1] if i + 1 < len(ws) else None
+        gap = float(nxt["start"]) - e if nxt else 9
+        sc = -abs(e - clip["end"]) / 8  # reste pres de la fin choisie par l'IA
+        if opts["loop"]:
+            sc += 1.0 if gap < .25 else -1.0 if gap > .6 else 0
+            if nxt and norm_word(nxt["word"]) == first and first:
+                sc += 3
+        else:
+            sc += 1.0 if gap > .5 else 0
+        if best_sc is None or sc > best_sc:
+            best, best_sc = (e, nxt), sc
+    if best is None:  # pas assez de parole : on garde ce qui rentre, au plus pres de dmax
+        last = [w for w in ws if kept(words, start, float(w["end"]) + .08, cut) <= dmax]
+        best = (float((last or ws)[-1]["end"]), None)
+    e, nxt = best
+    end = e + .08 if not nxt else min(e + .08, float(nxt["start"]))
+    return {**clip, "start": round(start, 2), "end": round(end, 2)}
+
+
+def select_clips(words, key, n, cat="auto", find="", opts=None):
+    opts = opts or parse_opts("{}")
     print("[3/4] choix des meilleurs moments (LLM Groq)...")
     total = int(float(words[-1]["end"]))
     chunks = chunk_lines(transcript_lines(words))
@@ -495,16 +554,16 @@ def select_clips(words, key, n, cat="auto", find=""):
         if len(chunks) > 1:
             print(f"    tranche {i + 1}/{len(chunks)}")
         try:
-            found += select_in(part, total, key, n, cat, find, len(chunks) > 1)
+            found += select_in(part, total, key, n, cat, find, len(chunks) > 1, opts)
         except (urllib.error.URLError, urllib.error.HTTPError, KeyError) as e:
             print(f"[info] LLM indisponible sur cette tranche ({e})")
-    if found:
-        return best_distinct(found, n)
-    print("[info] aucun extrait propose par le LLM, decoupage regulier en secours.")
-    return fallback_clips(total, n)
+    if not found:
+        print("[info] aucun extrait propose par le LLM, decoupage regulier en secours.")
+        found = fallback_clips(total, n, opts["dmax"])
+    return best_distinct([fit_clip(c, words, opts) for c in found], n)
 
 
-def select_in(transcript, total, key, n, cat, find, partial):
+def select_in(transcript, total, key, n, cat, find, partial, opts):
     sys_msg = ("Tu es un monteur expert en shorts viraux (TikTok, Reels, YouTube Shorts). "
                "A partir d'une transcription horodatee, tu reperes les meilleurs extraits "
                "autonomes a transformer en shorts verticaux.")
@@ -519,10 +578,14 @@ def select_in(transcript, total, key, n, cat, find, partial):
         '\"score\":<viralite 0-100>,\"reason\":\"<pourquoi ca marche, 1 phrase>\",'
         '\"caption\":\"<legende de post, 1-2 phrases accrocheuses>\",'
         '\"hashtags\":[\"<4 a 6 hashtags pertinents>\"]}]}\n'
-        "Regles : chaque extrait dure entre 15 et 60 secondes, start et end sont des "
+        f"Regles : chaque extrait dure entre {opts['dmin']} et {opts['dmax']} secondes, start et end sont des "
         "nombres en secondes pris dans la video, les extraits ne se chevauchent pas, "
         "tries du meilleur score au moins bon. Sans aucun emoji. Rien d'autre que le JSON.\n"
         + ENGLISH)
+    if opts["loop"]:
+        user_msg += ("\n\nLe short sera lu en boucle : choisis une fin qui s'enchaine "
+                     "naturellement avec la premiere phrase de l'extrait, en plein elan, "
+                     "sans conclusion ni au revoir, pour que le spectateur ne voie pas la coupure.")
     if CATS.get(cat):
         user_msg += "\n\nContexte : " + CATS[cat]
     if find:
@@ -580,9 +643,9 @@ def parse_clips(raw, total):
     return out
 
 
-def fallback_clips(total, n):
-    """Secours : n fenetres de 30s reparties si le LLM echoue."""
-    dur = min(30.0, max(15.0, total / max(n, 1)))
+def fallback_clips(total, n, dur=30.0):
+    """Secours : n fenetres reparties si le LLM echoue."""
+    dur = min(float(dur), max(15.0, total / max(n, 1)))
     base = {"score": 50, "caption": "", "hashtags": ""}
     if total <= dur:
         return [{"start": 0, "end": total, "title": "Short 1",
@@ -974,7 +1037,7 @@ def main():
         video = part
 
     words = transcribe(video, workdir, key)
-    clips = select_clips(words, key, args.clips, opts["cat"], opts["find"])
+    clips = select_clips(words, key, args.clips, opts["cat"], opts["find"], opts)
     iw, ih = video_dims(video)
     print(f"[4/4] rendu de {len(clips)} short(s)...")
 
@@ -1081,6 +1144,16 @@ def selfcheck():
                         (5, 10, {"crop": r2, "cam": None, "game": None})], plans(k)
     k["keys"] = [{"t": 6, "crop": r2}]
     assert [(a, b, r["crop"]["x"]) for a, b, r in plans(k)] == [(0, 4, .1), (4, 10, .6)]
+    o = parse_opts('{"dmin": 61, "dmax": 200, "loop": false}')
+    assert (o["dmin"], o["dmax"], o["loop"]) == (61, 90, False), o
+    assert (parse_opts('{"dmin": 80, "dmax": 82}')["dmin"], parse_opts("{}")["loop"]) == (40, True)
+    # parole continue : un mot toutes les 0,5 s, "so" revient a 70 s
+    talk = [{"word": "so" if i in (0, 140) else f"w{i}", "start": i * .5, "end": i * .5 + .4}
+            for i in range(300)]
+    lo = fit_clip({"start": 0, "end": 60}, talk, {**o, "dmin": 45, "dmax": 75, "loop": True, "cut": True})
+    assert lo["start"] == 0 and abs(lo["end"] - 69.98) < .05, lo  # coupe juste avant le "so"
+    nl = fit_clip({"start": 0, "end": 20}, talk, {**o, "dmin": 45, "dmax": 75, "loop": False, "cut": True})
+    assert 45 <= kept(talk, nl["start"], nl["end"], True) <= 75, nl
     assert ass_color("#FF4322") == "&H002243FF" and ink_on("#FFD60A") == "#0A0A0B" and ink_on("#111111") == "#FFFFFF"
     ch = chunk_lines("aaaaaa\nbbbbbb\ncccccc", size=15)
     assert ch == ["aaaaaa\nbbbbbb\n", "cccccc\n"], ch
