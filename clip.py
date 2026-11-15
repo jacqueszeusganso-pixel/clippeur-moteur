@@ -18,6 +18,7 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -437,15 +438,70 @@ def transcript_lines(words, group=10):
     return "\n".join(lines)
 
 
+# Offre gratuite Groq : 8000 jetons par minute, question et reponse comprises. Une demi-heure
+# de parole depasse ca (erreur 413) : on envoie la transcription par tranches.
+CHUNK_CHARS = 11000  # ~3500 jetons de transcription par appel
+
+
+def chunk_lines(text, size=CHUNK_CHARS):
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) > size:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    return chunks + [cur] if cur else chunks
+
+
+def chat_retry(messages, key, tries=4):
+    """groq_chat qui attend la fin de la minute quand le quota par minute est atteint."""
+    for i in range(tries):
+        try:
+            return groq_chat(messages, key)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or i == tries - 1:
+                raise
+            wait = min(float(e.headers.get("retry-after") or 30), 90) + 1
+            print(f"[info] quota Groq par minute atteint, pause de {wait:.0f} s")
+            time.sleep(wait)
+
+
+def best_distinct(clips, n):
+    """Meilleurs extraits sans chevauchement."""
+    out = []
+    for c in sorted(clips, key=lambda c: c["score"], reverse=True):
+        if all(c["end"] <= o["start"] or c["start"] >= o["end"] for o in out):
+            out.append(c)
+    return out[:n]
+
+
 def select_clips(words, key, n, cat="auto", find=""):
     print("[3/4] choix des meilleurs moments (LLM Groq)...")
     total = int(float(words[-1]["end"]))
+    chunks = chunk_lines(transcript_lines(words))
+    found = []
+    for i, part in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"    tranche {i + 1}/{len(chunks)}")
+        try:
+            found += select_in(part, total, key, n, cat, find, len(chunks) > 1)
+        except (urllib.error.URLError, urllib.error.HTTPError, KeyError) as e:
+            print(f"[info] LLM indisponible sur cette tranche ({e})")
+    if found:
+        return best_distinct(found, n)
+    print("[info] aucun extrait propose par le LLM, decoupage regulier en secours.")
+    return fallback_clips(total, n)
+
+
+def select_in(transcript, total, key, n, cat, find, partial):
     sys_msg = ("Tu es un monteur expert en shorts viraux (TikTok, Reels, YouTube Shorts). "
                "A partir d'une transcription horodatee, tu reperes les meilleurs extraits "
                "autonomes a transformer en shorts verticaux.")
+    what = (f"un passage de la transcription d'une video de {total}s" if partial
+            else f"la transcription d'une video de {total}s")
     user_msg = (
-        f"Voici la transcription d'une video de {total}s. Chaque ligne commence par son "
-        f"temps de debut en secondes.\n\n{transcript_lines(words)}\n\n"
+        f"Voici {what}. Chaque ligne commence par son "
+        f"temps de debut en secondes.\n\n{transcript}\n\n"
         f"Choisis les {n} meilleurs extraits. Reponds STRICTEMENT en JSON :\n"
         '{\"clips\":[{\"start\":<debut_en_secondes>,\"end\":<fin_en_secondes>,'
         '\"title\":\"<titre accrocheur, max 60 caracteres>\",'
@@ -464,16 +520,12 @@ def select_clips(words, key, n, cat="auto", find=""):
                      "moins probable (le score dit a quel point ca correspond). S'il n'y a "
                      "pas de correspondance exacte, donne les passages les plus proches. "
                      "Titre, legende et hashtags restent dans la langue de la video.")
-    try:
-        raw = groq_chat([{"role": "system", "content": sys_msg},
-                         {"role": "user", "content": user_msg}], key)
-        clips = parse_clips(raw, total)
-        if clips:
-            return clips[:n]
-        print("[info] reponse LLM inexploitable, decoupage regulier en secours.")
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError) as e:
-        print(f"[info] LLM indisponible ({e}), decoupage regulier en secours.")
-    return fallback_clips(total, n)
+    raw = chat_retry([{"role": "system", "content": sys_msg},
+                      {"role": "user", "content": user_msg}], key)
+    clips = parse_clips(raw, total)
+    if not clips:
+        print("[info] reponse LLM inexploitable sur cette tranche")
+    return clips
 
 
 def parse_clips(raw, total):
@@ -936,6 +988,11 @@ def selfcheck():
     assert a["layout"] == "split" and a["track"] and a["trim"] == [3, 20], a
     assert all(0 <= a["game"][k] <= 1 for k in "xywh"), a
     assert parse_spec(a, 30)["cam"] == a["cam"]  # ce que le moteur ecrit, l'editeur le relit
+    ch = chunk_lines("aaaaaa\nbbbbbb\ncccccc", size=15)
+    assert ch == ["aaaaaa\nbbbbbb\n", "cccccc\n"], ch
+    cl = [{"start": 0, "end": 30, "score": 70}, {"start": 20, "end": 50, "score": 90},
+          {"start": 60, "end": 80, "score": 50}]
+    assert [c["score"] for c in best_distinct(cl, 3)] == [90, 50]
     print("selfcheck OK")
     return 0
 
