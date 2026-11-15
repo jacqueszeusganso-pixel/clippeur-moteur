@@ -44,6 +44,8 @@ CATS = {
                "anecdotes et les avis tranches qui se comprennent seuls.",
 }
 MAX_RANGE = 3600  # une heure max par passage (quota audio Groq gratuit)
+LAYOUTS = ("auto", "full", "split")
+SPLIT_TOP = 0.4  # ecran partage : part de la hauteur donnee a la facecam
 
 
 # ----------------------------------------------------------------------------- utils
@@ -121,6 +123,7 @@ def parse_opts(raw):
         "cat": d.get("cat") if d.get("cat") in CATS else "auto",
         "cut": d.get("cut", True) is not False,
         "title": d.get("title", True) is not False,
+        "layout": d.get("layout") if d.get("layout") in LAYOUTS else "auto",
         "find": re.sub(r"\s+", " ", str(d.get("find") or ""))[:200].strip(),
         "start": None, "end": None,
     }
@@ -194,39 +197,134 @@ def _face_cascade():
     return _FACE_CASCADE
 
 
-def detect_face_center(video, start, end):
-    """Centre median du visage dominant sur l'extrait (OpenCV Haar). (0.5, 0.5) si rien."""
+YUNET = pathlib.Path(__file__).parent / "assets" / "face_detection_yunet_2023mar.onnx"
+
+
+def _face_finder():
+    """Fonction image BGR -> liste de boites (x, y, l, h). YuNet (reseau d'OpenCV, voit
+    les petites facecams, les casques, les trois-quarts) ; Haar en secours."""
+    import cv2
+    if hasattr(cv2, "FaceDetectorYN") and YUNET.exists():
+        det = {}
+
+        def yunet(img):
+            size = (img.shape[1], img.shape[0])
+            if det.get("size") != size:
+                det["d"] = cv2.FaceDetectorYN.create(str(YUNET), "", size, 0.6)
+                det["size"] = size
+            _, faces = det["d"].detect(img)
+            return [] if faces is None else [tuple(f[:4]) for f in faces]
+        return yunet
+    cascade = _face_cascade()
+    return lambda img: list(cascade.detectMultiScale(
+        cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 1.1, 5, minSize=(20, 20)))
+
+
+def face_samples(video, start, end, step=0.5):
+    """Visage dominant toutes les `step` s : liste de (t, cx, cy, largeur) normalises,
+    (t, None, None, None) quand rien n'est vu. Liste vide si OpenCV est indisponible."""
     try:
         import cv2
-        cascade = _face_cascade()
+        find = _face_finder()
     except Exception as e:  # cv2 absent ou KO -> recadrage centre
         print(f"[info] detection visage indisponible ({e}), recadrage centre.")
-        return 0.5, 0.5
+        return []
     cap = cv2.VideoCapture(str(video))
-    dur = max(0.1, end - start)
-    nsamp = int(min(15, max(4, dur)))
-    xs, ys = [], []
-    for i in range(nsamp):
-        t = start + dur * (i + 0.5) / nsamp
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    every = max(1, round(fps * step))
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    out = []
+    # lecture sequentielle : beaucoup plus rapide que de repositionner la video a chaque fois
+    for i in range(int((end - start) * fps)):
+        if i % every:
+            if not cap.grab():
+                break
+            continue
         ok, frame = cap.read()
         if not ok:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(40, 40))
+            break
+        w = frame.shape[1]
+        img = cv2.resize(frame, None, fx=960 / w, fy=960 / w) if w > 960 else frame
+        faces = find(img)
+        t = start + i / fps
         if len(faces) == 0:
+            out.append((t, None, None, None))
             continue
         fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        h, w = gray.shape[:2]
-        xs.append((fx + fw / 2) / w)
-        ys.append((fy + fh / 2) / h)
+        gh, gw = img.shape[:2]
+        out.append((t, (fx + fw / 2) / gw, (fy + fh / 2) / gh, fw / gw))
     cap.release()
-    if not xs:
-        return 0.5, 0.5
-    clamp = lambda v: min(max(v, 0.0), 1.0)
-    # ponytail: recadrage statique par clip (centre median). Suffit pour une tete
-    # qui parle ; passer a un suivi image par image si les sujets bougent beaucoup.
-    return clamp(statistics.median(xs)), clamp(statistics.median(ys))
+    return out
+
+
+def smooth_track(samples, axis=1, dead=0.06, pan=0.4):
+    """Trajectoire de camera calme : trous combles, filtre median sur 5 mesures, puis la
+    camera ne bouge que si le visage s'eloigne de plus de `dead` (fraction de l'image).
+    Renvoie [(t, position)] a interpoler lineairement, ou [] si aucun visage."""
+    vals = [smp[axis] for smp in samples]
+    if not any(v is not None for v in vals):
+        return []
+    first = next(v for v in vals if v is not None)
+    filled, last = [], first
+    for v in vals:
+        last = v if v is not None else last
+        filled.append(last)
+    med = [statistics.median(filled[max(0, i - 2):i + 3]) for i in range(len(filled))]
+    pts = [(samples[0][0], med[0])]
+    cam = med[0]
+    for (t, *_), v in zip(samples, med):
+        if abs(v - cam) > dead:
+            if t - pan > pts[-1][0]:
+                pts.append((t - pan, cam))  # tient la position, puis glisse en `pan` s
+            pts.append((t, v))
+            cam = v
+    return pts
+
+
+def piecewise_expr(points):
+    """[(t, valeur)] -> expression ffmpeg interpolant lineairement en fonction de t."""
+    if len(points) == 1:
+        return str(points[0][1])
+    expr = str(points[-1][1])
+    for (t0, v0), (t1, v1) in reversed(list(zip(points, points[1:]))):
+        expr = f"if(lt(t,{t1:.3f}),{v0}+({v1 - v0})*(t-{t0:.3f})/{t1 - t0:.3f},{expr})"
+    return expr
+
+
+def plan_layout(samples, opts, iw, ih):
+    """'split' (facecam en haut, jeu en bas) ou 'full' (plein cadre qui suit le visage)."""
+    faces = [smp for smp in samples if smp[1] is not None]
+    vertical = opts["format"] in ("9:16", "4:5") and iw > ih
+    if not faces or not vertical or opts["layout"] == "full":
+        return "full"
+    if opts["layout"] == "split":
+        return "split"
+    cx = statistics.median(f[1] for f in faces)
+    cy = statistics.median(f[2] for f in faces)
+    fw = statistics.median(f[3] for f in faces)
+    still = statistics.pstdev([f[1] for f in faces]) < 0.05
+    # facecam typique : petit visage fixe, dans un coin, visible la plupart du temps
+    # ponytail: heuristique simple ; un detecteur de cadre de facecam ferait mieux
+    if (fw < 0.13 and still and len(faces) >= 0.4 * len(samples) and opts["cat"] != "irl"
+            and (abs(cx - 0.5) > 0.2 or abs(cy - 0.5) > 0.2)):
+        return "split"
+    return "full"
+
+
+def facecam_crop(samples, iw, ih, ratio):
+    """Cadre autour de la facecam (visage median elargi), au ratio du panneau du haut."""
+    faces = [smp for smp in samples if smp[1] is not None]
+    cx = statistics.median(f[1] for f in faces) * iw
+    cy = statistics.median(f[2] for f in faces) * ih
+    fwp = statistics.median(f[3] for f in faces) * iw
+    bw = min(iw, fwp * 5)  # la boite YuNet serre le visage : x5 = tete et epaules
+    bh = bw / ratio
+    if bh > ih:
+        bh, bw = ih, ih * ratio
+    bw, bh = int(bw) // 2 * 2, int(bh) // 2 * 2
+    x = int(min(max(cx - bw / 2, 0), iw - bw))
+    y = int(min(max(cy + 0.25 * fwp - bh / 2, 0), ih - bh))
+    return bw, bh, x, y
 
 
 # ----------------------------------------------------------------------------- Groq HTTP
@@ -436,7 +534,7 @@ def ass_text(s):
             .replace("\n", " ").strip())
 
 
-def build_ass(words, segs, out_path, fmt="9:16", title="", group=3):
+def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None):
     """Sous-titres ASS : groupes de mots gros et centres, titre en haut si demande.
     `segs` = morceaux gardes de la source ; les temps sont recales dessus."""
     W, H, fs = FORMATS[fmt]
@@ -446,7 +544,7 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3):
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, "
         "Bold, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n"
         f"Style: Pop,Arial Black,{fs},&H00FFFFFF,&H00000000,&H00000000,"
-        f"-1,1,6,2,2,80,80,{round(H * .135)}\n"
+        f"-1,1,6,2,2,80,80,{round(H * .135) if margin_v is None else margin_v}\n"
         # titre : texte noir sur bandeau orange (BorderStyle 3 = boite opaque)
         f"Style: Title,Arial Black,{round(fs * .62)},&H000B0A0A,&H002243FF,&H00000000,"
         f"-1,3,14,0,8,90,90,{round(H * .07)}\n\n"
@@ -468,6 +566,27 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3):
     return out_path
 
 
+def track_crop(samples, segs, iw, ih, cw, ch):
+    """Position du cadre dans le temps (temps du clip), en pixels : (x, y) en expressions."""
+    if cw < iw:  # cadre plus etroit que la source : il glisse a l'horizontale
+        axis, span, size = 1, iw, cw
+    else:
+        axis, span, size = 2, ih, ch
+    pts = []
+    for t, v in smooth_track(samples, axis):
+        tt = remap(t, segs)
+        px = int(min(max(v * span - size / 2, 0), span - size))
+        if pts and tt <= pts[-1][0] + 1e-3:
+            pts[-1] = (pts[-1][0], px)
+        else:
+            pts.append((tt, px))
+    if not pts:
+        pts = [(0.0, (span - size) // 2)]
+    expr = piecewise_expr(pts)
+    other = str((ih - ch) // 2 if axis == 1 else (iw - cw) // 2)
+    return (expr, other) if axis == 1 else (other, expr)
+
+
 def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=None):
     opts = opts or parse_opts("{}")
     slug = slugify(clip["title"])
@@ -475,20 +594,38 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     subs = workdir / f"{name}.ass"
     s0, s1 = clip["start"], clip["end"]
     segs = keep_segments(words, s0, s1) if opts["cut"] else [(s0, s1)]
-    build_ass(words, segs, subs, opts["format"], clip["title"] if opts["title"] else "")
-    W, H, _ = FORMATS[opts["format"]]
-    cx, cy = detect_face_center(video, s0, s1) if use_face else (0.5, 0.5)
-    cw, ch, x, y = compute_crop(iw, ih, cx, cy, W / H)
-    out = workdir / f"{name}.mp4"
-    vf = f"crop={cw}:{ch}:{x}:{y},scale={W}:{H},setsar=1,subtitles={subs.name}"
-    af = []
+    W, H, fs = FORMATS[opts["format"]]
+    samples = face_samples(video, s0, s1) if use_face else []
+    layout = plan_layout(samples, opts, iw, ih)
+    title = clip["title"] if opts["title"] else ""
+    pre, af = "", []
     if segs != [(s0, s1)]:  # retrait des blancs : on ne garde que les morceaux parles
         sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
-        vf = f"select='{sel}',setpts=N/FRAME_RATE/TB," + vf
+        pre = f"select='{sel}',setpts=N/FRAME_RATE/TB,"
         af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
+    if layout == "split":
+        ht = int(H * SPLIT_TOP) // 2 * 2
+        hb = H - ht
+        # sous-titres a cheval sur la jonction des deux panneaux
+        build_ass(words, segs, subs, opts["format"], title, margin_v=hb - round(fs * .5))
+        fw_, fh_, fx, fy = facecam_crop(samples, iw, ih, W / ht)
+        gw, gh, gx, gy = compute_crop(iw, ih, 0.5, 0.5, W / hb)
+        graph = (f"[0:v]{pre}split=2[a][b];"
+                 f"[a]crop={fw_}:{fh_}:{fx}:{fy},scale={W}:{ht},setsar=1[top];"
+                 f"[b]crop={gw}:{gh}:{gx}:{gy},scale={W}:{hb},setsar=1[bot];"
+                 f"[top][bot]vstack,subtitles={subs.name}[v]")
+        vargs = ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
+    else:
+        build_ass(words, segs, subs, opts["format"], title)
+        cw, ch, _, _ = compute_crop(iw, ih, 0.5, 0.5, W / H)
+        x, y = track_crop(samples, segs, iw, ih, cw, ch)
+        vargs = ["-vf", f"{pre}crop=w={cw}:h={ch}:x='{x}':y='{y}',scale={W}:{H},setsar=1,"
+                        f"subtitles={subs.name}"]
+    print(f"    mise en page : {'ecran partage' if layout == 'split' else 'plein cadre'}")
+    out = workdir / f"{name}.mp4"
     # cwd=workdir pour eviter l'echappement des chemins Windows dans le filtre subtitles
-    run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1),
-         "-i", str(video.resolve()), "-vf", vf, *af, "-c:v", "libx264", "-preset", "veryfast",
+    run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(video.resolve()),
+         *vargs, *af, "-c:v", "libx264", "-preset", "veryfast",
          "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(workdir))
     subs.unlink(missing_ok=True)
     # pack de publication, pret a copier-coller
@@ -595,6 +732,29 @@ def selfcheck():
     assert abs(remap(14.0, segs) - 1.45) < 1e-9 and abs(remap(12.0, segs) - 1.3) < 1e-9
     assert keep_segments([], 5, 9) == [(5, 9)]
     assert ass_text("a{\\b1}\\Nc") == "a(/b1)/Nc"
+    # suivi du visage : bruit ignore (zone morte), vrai deplacement suivi avec un glissement
+    smp = [(i * .5, .5 + (.01 if i % 2 else 0), .5, .05) for i in range(6)] + \
+          [(3 + i * .5, .8, .5, .05) for i in range(6)]
+    tr = smooth_track(smp)
+    assert tr[0] == (0.0, .5) and tr[-1][1] == .8 and len(tr) == 3, tr
+    assert smooth_track([(0, None, None, None)]) == []
+    e = piecewise_expr([(0.0, 100), (2.0, 300)])
+    assert e == "if(lt(t,2.000),100+(200)*(t-0.000)/2.000,300)", e
+    assert piecewise_expr([(0.0, 7)]) == "7"
+    # mise en page : petit visage fixe dans un coin d'une source 16:9 -> ecran partage
+    cam = [(i * .5, .85, .8, .06) for i in range(10)]
+    assert plan_layout(cam, parse_opts("{}"), 1920, 1080) == "split"
+    assert plan_layout(cam, parse_opts('{"format":"1:1"}'), 1920, 1080) == "full"
+    assert plan_layout(cam, parse_opts('{"layout":"full"}'), 1920, 1080) == "full"
+    assert plan_layout(cam, parse_opts('{"cat":"irl"}'), 1920, 1080) == "full"
+    big = [(i * .5, .5, .4, .25) for i in range(10)]
+    assert plan_layout(big, parse_opts("{}"), 1920, 1080) == "full"
+    assert plan_layout(big, parse_opts('{"layout":"split"}'), 1920, 1080) == "split"
+    assert plan_layout([], parse_opts('{"layout":"split"}'), 1920, 1080) == "full"
+    bw, bh, bx, by = facecam_crop(cam, 1920, 1080, 1080 / 768)
+    assert bx + bw <= 1920 and by + bh <= 1080 and bw % 2 == 0 and bh % 2 == 0, (bw, bh, bx, by)
+    x, y = track_crop(cam, [(0, 5)], 1920, 1080, 608, 1080)
+    assert y == "0" and x.isdigit() and int(x) == 1920 - 608, (x, y)  # visage a droite, clampe
     print("selfcheck OK")
     return 0
 
