@@ -302,7 +302,9 @@ def plan_layout(samples, opts, iw, ih):
     cx = statistics.median(f[1] for f in faces)
     cy = statistics.median(f[2] for f in faces)
     fw = statistics.median(f[3] for f in faces)
-    still = statistics.pstdev([f[1] for f in faces]) < 0.05
+    # fixe = presque toutes les mesures pres de la mediane (un faux visage du jeu ne compte pas)
+    near = sum(abs(f[1] - cx) < 0.05 and abs(f[2] - cy) < 0.05 for f in faces)
+    still = near >= 0.8 * len(faces)
     # facecam typique : petit visage fixe, dans un coin, visible la plupart du temps
     # ponytail: heuristique simple ; un detecteur de cadre de facecam ferait mieux
     if (fw < 0.13 and still and len(faces) >= 0.4 * len(samples) and opts["cat"] != "irl"
@@ -744,6 +746,8 @@ def selfcheck():
     # mise en page : petit visage fixe dans un coin d'une source 16:9 -> ecran partage
     cam = [(i * .5, .85, .8, .06) for i in range(10)]
     assert plan_layout(cam, parse_opts("{}"), 1920, 1080) == "split"
+    noisy = cam + [(5.0, .5, .46, .055)]  # un faux visage dans le jeu
+    assert plan_layout(noisy, parse_opts("{}"), 1920, 1080) == "split"
     assert plan_layout(cam, parse_opts('{"format":"1:1"}'), 1920, 1080) == "full"
     assert plan_layout(cam, parse_opts('{"layout":"full"}'), 1920, 1080) == "full"
     assert plan_layout(cam, parse_opts('{"cat":"irl"}'), 1920, 1080) == "full"
