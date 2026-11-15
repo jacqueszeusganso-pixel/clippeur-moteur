@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.request
 import urllib.error
 
@@ -77,7 +78,10 @@ def load_groq_key():
 
 
 def slugify(text, maxlen=40):
-    s = re.sub(r"[^\w\s-]", "", text.lower(), flags=re.UNICODE)
+    # ASCII seulement : GitHub retire les accents des noms de fichiers publies, et le
+    # site ne retrouvait plus "jachète-..." devenu "jachete-..."
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    s = re.sub(r"[^\w\s-]", "", text.lower())
     s = re.sub(r"[\s_-]+", "-", s).strip("-")
     return (s or "short")[:maxlen]
 
@@ -999,6 +1003,7 @@ def selfcheck():
     cl = [{"start": 0, "end": 30, "score": 70}, {"start": 20, "end": 50, "score": 90},
           {"start": 60, "end": 80, "score": 50}]
     assert [c["score"] for c in best_distinct(cl, 3)] == [90, 50]
+    assert slugify("J'achète un supermarché !") == "jachete-un-supermarche"
     print("selfcheck OK")
     return 0
 
