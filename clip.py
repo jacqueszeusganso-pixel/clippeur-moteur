@@ -46,6 +46,7 @@ CATS = {
 MAX_RANGE = 3600  # une heure max par passage (quota audio Groq gratuit)
 LAYOUTS = ("auto", "full", "split")
 SPLIT_TOP = 0.4  # ecran partage : part de la hauteur donnee a la facecam
+EDGE = 5.0  # marge gardee autour de chaque extrait brut, pour l'allonger a l'edition
 
 
 # ----------------------------------------------------------------------------- utils
@@ -536,7 +537,8 @@ def ass_text(s):
             .replace("\n", " ").strip())
 
 
-def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None):
+def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None,
+              subs=True):
     """Sous-titres ASS : groupes de mots gros et centres, titre en haut si demande.
     `segs` = morceaux gardes de la source ; les temps sont recales dessus."""
     W, H, fs = FORMATS[fmt]
@@ -554,7 +556,7 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
     )
     lo, hi = segs[0][0], segs[-1][1]
     total = sum(b - a for a, b in segs)
-    win = [w for w in words if float(w["end"]) > lo and float(w["start"]) < hi]
+    win = [w for w in words if float(w["end"]) > lo and float(w["start"]) < hi] if subs else []
     events = []
     if title:
         events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(total)},Title,,0,0,0,,{ass_text(title)}")
@@ -589,52 +591,200 @@ def track_crop(samples, segs, iw, ih, cw, ch):
     return (expr, other) if axis == 1 else (other, expr)
 
 
-def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=None):
-    opts = opts or parse_opts("{}")
-    slug = slugify(clip["title"])
-    name = f"short_{index:02d}_{clip['score']:03d}_{slug}"
-    subs = workdir / f"{name}.ass"
-    s0, s1 = clip["start"], clip["end"]
-    segs = keep_segments(words, s0, s1) if opts["cut"] else [(s0, s1)]
-    W, H, fs = FORMATS[opts["format"]]
-    samples = face_samples(video, s0, s1) if use_face else []
-    layout = plan_layout(samples, opts, iw, ih)
-    title = clip["title"] if opts["title"] else ""
+def split_heights(H):
+    ht = int(H * SPLIT_TOP) // 2 * 2
+    return ht, H - ht
+
+
+def norm_rect(px, iw, ih):
+    w, h, x, y = px
+    return {"x": round(x / iw, 4), "y": round(y / ih, 4),
+            "w": round(w / iw, 4), "h": round(h / ih, 4)}
+
+
+def rect_px(r, iw, ih, ratio):
+    """Rectangle normalise (editeur) -> cadre en pixels au ratio exact, garde dans l'image."""
+    cx, cy = (r["x"] + r["w"] / 2) * iw, (r["y"] + r["h"] / 2) * ih
+    w = max(32.0, r["w"] * iw)
+    h = w / ratio
+    if h > ih:
+        h, w = ih, ih * ratio
+    if w > iw:
+        w, h = iw, iw / ratio
+    w, h = int(w) // 2 * 2, int(h) // 2 * 2
+    x = int(min(max(cx - w / 2, 0), iw - w))
+    y = int(min(max(cy - h / 2, 0), ih - h))
+    return w, h, x, y
+
+
+def parse_spec(d, dur):
+    """Reglages d'un short tels que l'editeur les envoie. Invalide -> valeur sure."""
+    d = d if isinstance(d, dict) else {}
+
+    def rect(r):
+        try:
+            r = {k: float(r[k]) for k in "xywh"}
+        except (KeyError, TypeError, ValueError):
+            return None
+        ok = all(0 <= r[k] <= 1 for k in "xy") and all(0.02 <= r[k] <= 1 for k in "wh")
+        return r if ok else None
+    try:
+        a, b = float(d["trim"][0]), float(d["trim"][1])
+        if not (0 <= a < b <= dur + 0.05 and b - a >= 1):
+            raise ValueError
+        b = min(b, dur)
+    except (KeyError, TypeError, ValueError, IndexError):
+        a, b = 0.0, dur
+    return {
+        "format": d.get("format") if d.get("format") in FORMATS else "9:16",
+        "layout": "split" if d.get("layout") == "split" else "full",
+        "crop": rect(d.get("crop")), "cam": rect(d.get("cam")), "game": rect(d.get("game")),
+        "track": d.get("track") is True,
+        "trim": [round(a, 2), round(b, 2)],
+        "cut": d.get("cut", True) is not False,
+        "subs": d.get("subs", True) is not False,
+        "title": ass_text(str(d.get("title") or ""))[:100],
+        "ask": re.sub(r"\s+", " ", str(d.get("ask") or ""))[:300].strip(),
+    }
+
+
+def auto_spec(samples, opts, iw, ih, s0, s1, title):
+    """Reglages de depart d'un short : ce que le moteur choisit seul, modifiable ensuite."""
+    W, H, _ = FORMATS[opts["format"]]
+    ht, hb = split_heights(H)
+    faces = [smp for smp in samples if smp[1] is not None]
+    cx = statistics.median(f[1] for f in faces) if faces else 0.5
+    cy = statistics.median(f[2] for f in faces) if faces else 0.5
+    cam = facecam_crop(samples, iw, ih, W / ht) if faces else \
+        compute_crop(iw, ih, 0.12, 0.15, W / ht)
+    return {
+        "format": opts["format"], "layout": plan_layout(samples, opts, iw, ih),
+        "crop": norm_rect(compute_crop(iw, ih, cx, cy, W / H), iw, ih),
+        "cam": norm_rect(cam, iw, ih),
+        "game": norm_rect(compute_crop(iw, ih, 0.5, 0.5, W / hb), iw, ih),
+        "track": bool(faces), "trim": [round(s0, 2), round(s1, 2)],
+        "cut": opts["cut"], "subs": True, "title": title, "ask": "",
+    }
+
+
+def render_spec(raw, words, spec, out, samples=None):
+    """Rend un short a partir de son extrait brut. `words` en temps de l'extrait."""
+    iw, ih = video_dims(raw)
+    W, H, fs = FORMATS[spec["format"]]
+    s0, s1 = spec["trim"]
+    segs = keep_segments(words, s0, s1) if spec["cut"] else [(s0, s1)]
+    subs = out.with_suffix(".ass")
     pre, af = "", []
     if segs != [(s0, s1)]:  # retrait des blancs : on ne garde que les morceaux parles
         sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
         pre = f"select='{sel}',setpts=N/FRAME_RATE/TB,"
         af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
-    if layout == "split":
-        ht = int(H * SPLIT_TOP) // 2 * 2
-        hb = H - ht
+    split = spec["layout"] == "split" and spec["cam"] and spec["game"] and spec["format"] in ("9:16", "4:5")
+    if split:
+        ht, hb = split_heights(H)
         # sous-titres a cheval sur la jonction des deux panneaux
-        build_ass(words, segs, subs, opts["format"], title, margin_v=hb - round(fs * .5))
-        fw_, fh_, fx, fy = facecam_crop(samples, iw, ih, W / ht)
-        gw, gh, gx, gy = compute_crop(iw, ih, 0.5, 0.5, W / hb)
+        build_ass(words, segs, subs, spec["format"], spec["title"],
+                  margin_v=hb - round(fs * .5), subs=spec["subs"])
+        fw_, fh_, fx, fy = rect_px(spec["cam"], iw, ih, W / ht)
+        gw, gh, gx, gy = rect_px(spec["game"], iw, ih, W / hb)
         graph = (f"[0:v]{pre}split=2[a][b];"
                  f"[a]crop={fw_}:{fh_}:{fx}:{fy},scale={W}:{ht},setsar=1[top];"
                  f"[b]crop={gw}:{gh}:{gx}:{gy},scale={W}:{hb},setsar=1[bot];"
                  f"[top][bot]vstack,subtitles={subs.name}[v]")
         vargs = ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
     else:
-        build_ass(words, segs, subs, opts["format"], title)
-        cw, ch, _, _ = compute_crop(iw, ih, 0.5, 0.5, W / H)
-        x, y = track_crop(samples, segs, iw, ih, cw, ch)
+        build_ass(words, segs, subs, spec["format"], spec["title"], subs=spec["subs"])
+        if spec["track"] and samples:
+            cw, ch, _, _ = compute_crop(iw, ih, 0.5, 0.5, W / H)
+            x, y = track_crop(samples, segs, iw, ih, cw, ch)
+        elif spec["crop"]:  # cadre choisi a la main : fixe, et zoome s'il est plus petit
+            cw, ch, x, y = rect_px(spec["crop"], iw, ih, W / H)
+        else:
+            cw, ch, x, y = compute_crop(iw, ih, 0.5, 0.5, W / H)
         vargs = ["-vf", f"{pre}crop=w={cw}:h={ch}:x='{x}':y='{y}',scale={W}:{H},setsar=1,"
                         f"subtitles={subs.name}"]
-    print(f"    mise en page : {'ecran partage' if layout == 'split' else 'plein cadre'}")
-    out = workdir / f"{name}.mp4"
-    # cwd=workdir pour eviter l'echappement des chemins Windows dans le filtre subtitles
-    run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(video.resolve()),
+    print(f"    mise en page : {'ecran partage' if split else 'plein cadre'}")
+    # cwd=dossier de sortie pour eviter l'echappement des chemins Windows dans subtitles
+    run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()),
          *vargs, *af, "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(workdir))
+         "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(out.parent.resolve()))
     subs.unlink(missing_ok=True)
+    return out
+
+
+def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=None,
+                total=None):
+    """Extrait brut (moment + marge) puis short. Renvoie l'entree de shorts.json."""
+    opts = opts or parse_opts("{}")
+    name = f"short_{index:02d}_{clip['score']:03d}_{slugify(clip['title'])}"
+    total = total or ffprobe_duration(video)
+    r0, r1 = max(0.0, clip["start"] - EDGE), min(total, clip["end"] + EDGE)
+    raw = workdir / f"raw_{index:02d}.mp4"
+    # extrait reencode (coupe exacte) : c'est lui que l'editeur montre et recadre
+    run(["ffmpeg", "-y", "-ss", str(r0), "-to", str(r1), "-i", str(video.resolve()),
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "160k",
+         str(raw)])
+    rel = [{"word": w["word"].strip(), "start": round(float(w["start"]) - r0, 2),
+            "end": round(float(w["end"]) - r0, 2)}
+           for w in words if float(w["end"]) > r0 and float(w["start"]) < r1]
+    s0, s1 = clip["start"] - r0, clip["end"] - r0
+    samples = face_samples(raw, s0, s1) if use_face else []
+    spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "")
+    out = render_spec(raw, rel, spec, workdir / f"{name}.mp4", samples)
     # pack de publication, pret a copier-coller
     tags = clip.get("hashtags", "")
     (workdir / f"{name}.txt").write_text(
         f"{clip['title']}\n\n{clip.get('caption', '')}\n\n{tags}\n", encoding="utf-8")
-    return out
+    return {**clip, "file": out.name, "raw": raw.name, "dur": round(r1 - r0, 2), "spec": spec,
+            "words": [[w["word"], w["start"], w["end"]] for w in rel]}
+
+
+def ask_edit(spec, words, dur, key):
+    """Consigne en francais courant -> changements de reglages (trim, titre, format...)."""
+    shown = {k: spec[k] for k in ("format", "layout", "trim", "cut", "subs", "title")}
+    msg = (
+        f"Reglages actuels du short : {json.dumps(shown, ensure_ascii=False)}\n"
+        f"L'extrait brut dure {dur:.1f} s ; trim = [debut, fin] en secondes dans cet extrait.\n"
+        f"Transcription horodatee de l'extrait :\n{transcript_lines(words, 6)}\n\n"
+        f"Demande du monteur : \u00ab {spec['ask']} \u00bb\n\n"
+        'Reponds STRICTEMENT en JSON : {"changes": {...}} avec seulement les cles a modifier '
+        "parmi trim, title, cut, subs, format (9:16, 4:5, 1:1, 16:9) et layout (full ou split). "
+        "Le titre reste dans la langue de la video, sans emoji.")
+    try:
+        raw = groq_chat([{"role": "system", "content": "Tu es monteur de shorts. Tu ne reponds qu'en JSON."},
+                         {"role": "user", "content": msg}], key)
+        ch = json.loads(raw).get("changes") or {}
+    except (urllib.error.URLError, KeyError, ValueError, AttributeError) as e:
+        print(f"[info] consigne IA non appliquee ({e})")
+        return spec
+    allowed = ("trim", "title", "cut", "subs", "format", "layout")
+    return {**spec, **{k: v for k, v in ch.items() if k in allowed}, "ask": ""}
+
+
+def edit_main(args):
+    """Refait un short depuis son extrait brut avec les reglages de l'editeur."""
+    meta = json.loads(pathlib.Path(args.meta).read_text(encoding="utf-8"))
+    raw = pathlib.Path(args.raw)
+    entry = next((m for m in meta if m.get("raw") == raw.name), None)
+    if not entry:
+        sys.exit(f"[erreur] {raw.name} absent de shorts.json")
+    words = [{"word": w, "start": a, "end": b} for w, a, b in entry["words"]]
+    dur = ffprobe_duration(raw)
+    try:
+        spec = parse_spec(json.loads(args.spec), dur)
+    except json.JSONDecodeError:
+        sys.exit("[erreur] reglages illisibles")
+    if spec["ask"]:
+        spec = parse_spec(ask_edit(spec, words, dur, load_groq_key()), dur)
+    samples = None
+    if spec["track"] and spec["layout"] == "full":
+        samples = face_samples(raw, *spec["trim"])
+    out = pathlib.Path(args.edit_out)
+    render_spec(raw, words, spec, out, samples)
+    spec["ask"] = ""
+    out.with_suffix(".json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    print(f"Edition prete : {out}")
+    return 0
 
 
 # ----------------------------------------------------------------------------- main
@@ -650,11 +800,20 @@ def main():
     ap.add_argument("--opts", default=os.environ.get("OPTS", "{}"),
                     help='reglages JSON : {"format":"9:16","cat":"auto","cut":true,'
                          '"title":true,"find":"","start":0,"end":600}')
+    ap.add_argument("--edit", type=int, help="refaire le short N depuis son extrait brut")
+    ap.add_argument("--meta", help="shorts.json du travail (avec --edit)")
+    ap.add_argument("--raw", help="extrait brut raw_NN.mp4 (avec --edit)")
+    ap.add_argument("--spec", default=os.environ.get("SPEC", "{}"), help="reglages JSON de l'editeur")
+    ap.add_argument("--edit-out", help="fichier de sortie de l'edition")
     ap.add_argument("--selfcheck", action="store_true", help="tests internes rapides")
     args = ap.parse_args()
 
     if args.selfcheck:
         return selfcheck()
+    if args.edit:
+        if not (args.meta and args.raw and args.edit_out):
+            ap.error("--edit demande --meta, --raw et --edit-out")
+        return edit_main(args)
     if not args.source:
         ap.error("donne une URL ou un fichier (ou --selfcheck)")
 
@@ -684,12 +843,12 @@ def main():
     iw, ih = video_dims(video)
     print(f"[4/4] rendu de {len(clips)} short(s)...")
 
-    meta = []
+    meta, total = [], ffprobe_duration(video)
     for i, clip in enumerate(clips, 1):
-        out = render_clip(video, words, clip, workdir, i, iw, ih,
-                          use_face=not args.no_face, opts=opts)
-        meta.append({**clip, "file": out.name})
-        print(f"  - {out.name}  (score {clip['score']}/100)  {clip['title']}")
+        entry = render_clip(video, words, clip, workdir, i, iw, ih,
+                            use_face=not args.no_face, opts=opts, total=total)
+        meta.append(entry)
+        print(f"  - {entry['file']}  (score {clip['score']}/100)  {clip['title']}")
     (workdir / "partie.mp4").unlink(missing_ok=True)  # sinon publie avec les shorts
     (workdir / "shorts.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -759,6 +918,24 @@ def selfcheck():
     assert bx + bw <= 1920 and by + bh <= 1080 and bw % 2 == 0 and bh % 2 == 0, (bw, bh, bx, by)
     x, y = track_crop(cam, [(0, 5)], 1920, 1080, 608, 1080)
     assert y == "0" and x.isdigit() and int(x) == 1920 - 608, (x, y)  # visage a droite, clampe
+    # editeur : reglages invalides ramenes a des valeurs sures
+    sp = parse_spec({"format": "4:5", "layout": "split", "trim": [2, 9],
+                     "crop": {"x": .1, "y": 0, "w": .3, "h": 1}, "cam": {"x": 2, "y": 0, "w": .1, "h": .1},
+                     "title": "Titre {x}", "track": "oui"}, dur=20)
+    assert sp["format"] == "4:5" and sp["layout"] == "split" and sp["trim"] == [2.0, 9.0], sp
+    assert sp["crop"]["w"] == .3 and sp["cam"] is None and sp["track"] is False, sp
+    assert sp["title"] == "Titre (x)" and sp["cut"] and sp["subs"], sp
+    assert parse_spec({"trim": [5, 99]}, dur=20)["trim"] == [0.0, 20], "trim hors extrait"
+    assert parse_spec("n'importe quoi", dur=8)["format"] == "9:16"
+    # cadre de l'editeur -> pixels au bon ratio, dans l'image
+    w, h, x, y = rect_px({"x": .9, "y": .1, "w": .2, "h": .5}, 1920, 1080, 9 / 16)
+    assert abs(w / h - 9 / 16) < .01 and x + w <= 1920 and y + h <= 1080, (w, h, x, y)
+    w, h, x, y = rect_px({"x": 0, "y": 0, "w": 1, "h": 1}, 1920, 1080, 9 / 16)
+    assert h == 1080 and w == 606, (w, h)
+    a = auto_spec(cam, parse_opts("{}"), 1920, 1080, 3, 20, "T")
+    assert a["layout"] == "split" and a["track"] and a["trim"] == [3, 20], a
+    assert all(0 <= a["game"][k] <= 1 for k in "xywh"), a
+    assert parse_spec(a, 30)["cam"] == a["cam"]  # ce que le moteur ecrit, l'editeur le relit
     print("selfcheck OK")
     return 0
 

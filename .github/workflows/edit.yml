@@ -1,0 +1,61 @@
+# Editeur du clippeur maison : refait un short depuis son extrait brut avec les reglages du site
+name: edit
+run-name: edit ${{ inputs.job_id }} ${{ inputs.clip }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Identifiant du travail
+        required: true
+      clip:
+        description: Numero du short (1 a 6)
+        required: true
+      out:
+        description: Identifiant de cette version
+        required: true
+      spec:
+        description: Reglages JSON de l'editeur
+        default: "{}"
+
+permissions:
+  contents: write
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JOB: ${{ inputs.job_id }}
+      CLIP: ${{ inputs.clip }}
+      OUT: ${{ inputs.out }}
+      SPEC: ${{ inputs.spec }}
+    steps:
+      - name: Verifier les entrees
+        run: |
+          [[ "$JOB" =~ ^[a-f0-9]{16}$ ]] || { echo "job_id invalide"; exit 1; }
+          [[ "$CLIP" =~ ^[1-6]$ ]] || { echo "clip invalide"; exit 1; }
+          [[ "$OUT" =~ ^[a-f0-9]{8}$ ]] || { echo "out invalide"; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Outils
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q opencv-python-headless numpy
+      - name: Recuperer l'extrait
+        run: gh release download "job-$JOB" -p "raw_0$CLIP.mp4" -p shorts.json -D in
+      - name: Monter
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        # SPEC est relu et valide par clip.py (parse_spec), jamais interprete par le shell
+        run: python clip.py --edit "$CLIP" --meta in/shorts.json --raw "in/raw_0$CLIP.mp4" --edit-out "edit_0${CLIP}_$OUT.mp4"
+      - name: Publier
+        run: gh release upload "job-$JOB" "edit_0${CLIP}_$OUT.mp4" "edit_0${CLIP}_$OUT.json" --clobber
+      - name: Signaler l'echec
+        if: failure()
+        run: |
+          echo "echec de l'edition" > "edit_0${CLIP}_$OUT.err"
+          gh release upload "job-$JOB" "edit_0${CLIP}_$OUT.err" --clobber
