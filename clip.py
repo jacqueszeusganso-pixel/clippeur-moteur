@@ -815,17 +815,19 @@ def parse_keys(keys, dur, rect):
             continue
         r = {n: rect(k.get(n)) for n in ("crop", "cam", "game")}
         if 0 <= t <= dur and any(r.values()):
-            out[t] = {"t": t, **{n: v for n, v in r.items() if v}}
+            # mise en page de ce plan ; anciennes cles sans elle : deduite des cadres valides
+            lay = k.get("layout") if k.get("layout") in ("full", "split") else                 "full" if r["crop"] and not (r["cam"] or r["game"]) else "split"
+            out[t] = {"t": t, "layout": lay, **{n: v for n, v in r.items() if v}}
     return [out[t] for t in sorted(out)][:MAX_KEYS]
 
 
 def plans(spec):
     """Decoupe le short en plans [(debut, fin, cadres)] en temps du short (0 = debut de coupe)."""
     s0, s1 = spec["trim"]
-    cur = {n: spec[n] for n in ("crop", "cam", "game")}
+    cur = {n: spec[n] for n in ("crop", "cam", "game", "layout")}
     out = [[s0, cur]]
     for k in spec.get("keys") or []:
-        r = {**out[-1][1], **{n: k[n] for n in ("crop", "cam", "game") if k.get(n)}}
+        r = {**out[-1][1], **{n: k[n] for n in ("crop", "cam", "game", "layout") if k.get(n)}}
         if k["t"] <= s0 + .05:
             out[-1][1] = r
         elif k["t"] < s1 - .05:
@@ -1385,6 +1387,13 @@ def render_spec(raw, words, spec, out, samples=None):
     W, H, fs = FORMATS[spec["format"]]
     s0, s1 = spec["trim"]
     segs = keep_segments(words, s0, s1) if spec["cut"] else [(s0, s1)]
+    cuts = plans(spec)
+    lays = [r["layout"] for _, _, r in cuts]
+    if spec["format"] not in ("9:16", "4:5") or iw <= ih:
+        lays = ["full"] * len(cuts)
+    if len(set(lays)) > 1:  # plein cadre et ecran partage alternes : une version de chaque, recollees
+        return splice_layouts(raw, words, spec, out, samples, cuts, lays, segs)
+    spec = {**spec, "layout": lays[0], "keys": [{**k, "layout": lays[0]} for k in spec.get("keys") or []]}
     subs = out.with_suffix(".ass")
     pre, af = "", []
     if segs != [(s0, s1)]:  # retrait des blancs : on ne garde que les morceaux parles
@@ -1471,6 +1480,38 @@ def render_spec(raw, words, spec, out, samples=None):
          *vargs, *af, "-c:v", "libx264", "-preset", "veryfast",
          "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(out.parent.resolve()))
     subs.unlink(missing_ok=True)
+    return out
+
+
+def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs):
+    """Short qui alterne plein cadre et ecran partage : chaque mise en page est rendue sur
+    toute la duree (decor et sous-titres a leur place), puis on garde les bons morceaux."""
+    s0 = spec["trim"][0]
+    tmp = {}
+    for lay in sorted(set(lays)):
+        tmp[lay] = out.with_name(f"_{lay}_{out.name}")
+        render_spec(raw, words, {**spec, "layout": lay,
+                                 "keys": [{**k, "layout": lay} for k in spec["keys"]]}, tmp[lay], samples)
+    order = sorted(tmp)
+    pieces = []  # (mise en page, debut, fin) en temps du short final, plans voisins fusionnes
+    for (a, b, _), lay in zip(cuts, lays):
+        ta, tb = remap(s0 + a, segs), remap(s0 + b, segs)
+        if tb - ta < 0.02:
+            continue
+        if pieces and pieces[-1][0] == lay:
+            pieces[-1][2] = tb
+        else:
+            pieces.append([lay, ta, tb])
+    pieces[-1][2] = 1e6  # le dernier morceau va jusqu'au bout
+    g = [f"[{order.index(lay)}:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[q{i}]"
+         for i, (lay, a, b) in enumerate(pieces)]
+    g.append("".join(f"[q{i}]" for i in range(len(pieces))) + f"concat=n={len(pieces)}:v=1:a=0[v]")
+    run(["ffmpeg", "-y", *sum((["-i", str(tmp[k].resolve())] for k in order), []),
+         "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
+         "-preset", "veryfast", "-crf", "20", "-c:a", "copy", str(out.resolve())])
+    for p in tmp.values():
+        p.unlink(missing_ok=True)
+    print(f"    {len(pieces)} passages plein cadre / ecran partage")
     return out
 
 
@@ -1708,8 +1749,12 @@ def selfcheck():
                     "keys": [{"t": 7, "crop": r2}, {"t": 2, "crop": r2}, {"t": "x"}, {"t": 5}]}, dur=20)
     assert k["color"] == "#FFD60A" and k["subc"] == "#FFFFFF", k
     assert [x["t"] for x in k["keys"]] == [2, 7], k["keys"]
-    assert plans(k) == [(0, 5, {"crop": r2, "cam": None, "game": None}),
-                        (5, 10, {"crop": r2, "cam": None, "game": None})], plans(k)
+    assert plans(k) == [(0, 5, {"crop": r2, "cam": None, "game": None, "layout": "full"}),
+                        (5, 10, {"crop": r2, "cam": None, "game": None, "layout": "full"})], plans(k)
+    # mise en page par plan : explicite, ou deduite des cadres d'une ancienne cle
+    m = parse_spec({"trim": [0, 10], "keys": [{"t": 3, "cam": r1, "game": r2}, {"t": 6, "crop": r2},
+                                              {"t": 8, "crop": r1, "layout": "split"}]}, dur=10)
+    assert [r["layout"] for *_, r in plans(m)] == ["full", "split", "full", "split"], plans(m)
     k["keys"] = [{"t": 6, "crop": r2}]
     assert [(a, b, r["crop"]["x"]) for a, b, r in plans(k)] == [(0, 4, .1), (4, 10, .6)]
     o = parse_opts('{"dmin": 61, "dmax": 200, "loop": false}')

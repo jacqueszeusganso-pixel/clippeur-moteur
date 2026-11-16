@@ -19,8 +19,8 @@ def step(name, fn):
 
 tts = ChatterboxTTS.from_pretrained(device="cpu")
 vc = ChatterboxVC.from_pretrained(device="cpu")
-# 1. clone direct, cfg 0 : limite l'heritage d'accent de l'echantillon (conseil Chatterbox)
-step("clone_cfg0", lambda: tts.generate(text, audio_prompt_path=ref, exaggeration=0.8, cfg_weight=0))
+# 1. clone direct, cfg tres bas (0 plante en 0.1.7) : limite l'heritage d'accent de l'echantillon (conseil Chatterbox)
+step("clone_cfg0", lambda: tts.generate(text, audio_prompt_path=ref, exaggeration=0.8, cfg_weight=0.1))
 # 2. voix americaine par defaut de Chatterbox, enthousiaste (source de la conversion)
 step("source_us", lambda: tts.generate(text, exaggeration=0.8, cfg_weight=0.3))
 # 3. conversion : accent americain de la source, timbre de Jacques
