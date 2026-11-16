@@ -797,6 +797,7 @@ def parse_spec(d, dur):
         "color": d["color"].upper() if HEX_RE.match(str(d.get("color") or "")) else ACCENT,
         "subc": d["subc"].upper() if HEX_RE.match(str(d.get("subc") or "")) else "#FFFFFF",
         "keys": parse_keys(d.get("keys"), dur, rect),
+        "auto": d.get("auto") is True,  # editeur : "refais le cadrage tout seul"
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
         "bleed": d.get("bleed", True) is not False,
         "voice": d.get("voice") is True,
@@ -885,6 +886,165 @@ def base_spec(samples, opts, iw, ih, s0, s1, title):
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
         "color": ACCENT, "subc": "#FFFFFF", "keys": [], "voice": opts.get("voice", False),
     }
+
+
+# ----------------------------------------------------------------------------- realisateur auto
+# Refait ce que fait un monteur a la main : a chaque plan, ou est ce qui interesse ?
+# Un seul centre d'interet -> plein cadre cale dessus. Deux centres trop eloignes pour
+# tenir ensemble dans le 9:16 -> ecran partage, un panneau sur chacun.
+
+def win_ratios(spec, iw, ih):
+    """Ratio largeur/hauteur de chaque cadre : crop (plein cadre), cam (haut), game (bas)."""
+    W, H, _ = FORMATS[spec["format"]]
+    ht, hb = split_heights(H)
+    out = {"crop": W / H, "cam": W / ht, "game": W / hb}
+    th = THEMES.get(spec.get("theme"))
+    if th and spec["format"] == "9:16":
+        b = "b" if spec.get("bleed", True) else ""
+        f, sp = th[b + "full"], th[b + "split"]
+        out = {"crop": f[0][2] / f[0][3], "cam": sp[0][2] / sp[0][3], "game": sp[-1][2] / sp[-1][3]}
+    return out
+
+
+def _saliency(gray):
+    """Residu spectral (Hou 2007) : ce qui sort du lot dans l'image, sans reseau."""
+    import cv2
+    import numpy as np
+    g = cv2.resize(gray, (64, 64)).astype(np.float32)
+    f = np.fft.fft2(g)
+    log = np.log(np.abs(f) + 1e-6)
+    sal = np.abs(np.fft.ifft2(np.exp(log - cv2.blur(log, (3, 3)) + 1j * np.angle(f)))) ** 2
+    return cv2.resize(cv2.GaussianBlur(sal.astype(np.float32), (9, 9), 2.5), gray.shape[::-1])
+
+
+def _window(prof, w):
+    """Fenetre de largeur w (en colonnes) qui capte le plus d'interet : (debut, masse)."""
+    import numpy as np
+    c = np.concatenate([[0], np.cumsum(prof)])
+    sums = c[w:] - c[:-w]
+    i = int(np.argmax(sums))
+    return i, float(sums[i])
+
+
+def director(raw, s0, s1, iw, ih, spec, step=0.25, chunk=3.0):
+    """Plans auto [(t, layout, {crop} ou {cam, game})] sur [s0, s1], [] si OpenCV manque."""
+    try:
+        import cv2
+        import numpy as np
+        find = _face_finder()
+    except Exception as e:
+        print(f"[info] realisateur auto indisponible ({e})")
+        return []
+    cap = cv2.VideoCapture(str(raw))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    every = max(1, round(fps * step))
+    cap.set(cv2.CAP_PROP_POS_MSEC, s0 * 1000)
+    frames = []  # (t, gris 320 px, histogramme, image 960 px)
+    for i in range(int((s1 - s0) * fps)):
+        if i % every:
+            if not cap.grab():
+                break
+            continue
+        ok, img = cap.read()
+        if not ok:
+            break
+        big = cv2.resize(img, (960, round(960 * img.shape[0] / img.shape[1])))
+        small = cv2.resize(big, (320, round(320 * img.shape[0] / img.shape[1])))
+        hist = cv2.calcHist([cv2.cvtColor(small, cv2.COLOR_BGR2HSV)], [0, 1], None, [16, 8], [0, 180, 0, 256])
+        frames.append((s0 + i / fps, cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32),
+                       cv2.normalize(hist, hist).flatten(), big))
+    cap.release()
+    if len(frames) < 4:
+        return []
+    h, w = frames[0][1].shape
+    # interface du jeu (minimap, etoiles, logo) : ne bouge jamais d'un bout a l'autre
+    hud = (np.std([f[1] for f in frames], axis=0) < 6).astype(np.float32)
+    hud = cv2.dilate(hud, np.ones((5, 5), np.uint8))
+    # changements de plan : la palette de couleurs saute d'une image a l'autre
+    bounds = [0] + [i for i in range(1, len(frames))
+                    if cv2.compareHist(frames[i - 1][2], frames[i][2], cv2.HISTCMP_CORREL) < 0.55]
+    bounds.append(len(frames))
+    groups = []
+    for a, b in zip(bounds, bounds[1:]):
+        n = max(1, round((b - a) * step / chunk))
+        groups += [(a + (b - a) * j // n, a + (b - a) * (j + 1) // n, j == 0) for j in range(n)]
+    rat = win_ratios(spec, iw, ih)
+    gy, gx = np.mgrid[0:h, 0:w]
+    centre = 0.6 + 0.4 * np.exp(-(((gx / w - .5) / .35) ** 2 + ((gy / h - .5) / .45) ** 2))
+    two_ok = iw > ih and spec["format"] in ("9:16", "4:5")
+    out = []
+    for a, b, cut in groups:
+        fs = frames[a:b]
+        mo, mw = np.zeros((h, w), np.float32), 0.45
+        if len(fs) > 1:
+            mo = np.mean([np.abs(x[1] - y[1]) for x, y in zip(fs, fs[1:])], axis=0)
+            if (mo > 8).mean() > 0.25:  # camera qui roule : tout le decor bouge, ca ne dit rien
+                mw = 0.07
+            mo = np.clip(mo - np.median(mo) * 1.5, 0, None)  # on retire le mouvement de camera
+        mid = fs[len(fs) // 2]
+        face = np.zeros((h, w), np.float32)
+        k = w / mid[3].shape[1]
+        for fx, fy, fw, fh in find(mid[3]):
+            cv2.circle(face, (int((fx + fw / 2) * k), int((fy + fh / 2) * k)), max(4, int(fw * k)), 1.0, -1)
+        maps = [m / (m.sum() + 1e-6) for m in (mo, _saliency(mid[1]), face)]
+        imp = (mw * maps[0] + 0.45 * maps[1] + 0.8 * maps[2]) * (1 - 0.85 * hud) * centre
+        imp = cv2.GaussianBlur(imp.astype(np.float32), (0, 0), 3)
+        prof = imp.sum(axis=0)
+        tot = float(prof.sum()) + 1e-9
+        fw_ = max(2, min(w, round(h * rat["crop"])))  # largeur du plein cadre, en colonnes
+        x1, m1 = _window(prof, fw_)
+        # deux centres : le plus fort, puis le plus fort une fois le premier efface
+        nw = max(2, round(fw_ * 0.7))
+        xa, ma = _window(prof, nw)
+        rest = prof.copy()
+        rest[max(0, xa - nw // 3):xa + nw + nw // 3] = 0
+        xb, mb = _window(rest, nw)
+        far = abs(xa - xb) > fw_ * 0.9
+        # partage : deux vrais pics (pas un decor uniforme), le 2e presque aussi fort que le 1er,
+        # trop loin l'un de l'autre pour tenir ensemble dans le plein cadre
+        # image sombre ou terne (std < 28) : le 2e "centre" n'est que du bruit
+        two = two_ok and far and mb > 0.55 * ma and (ma + mb) / tot > 2.6 * nw / w and mid[1].std() > 28
+
+        def box(x0, ww, ratio):
+            """Cadre au ratio voulu sur la bande [x0, x0+ww], centre en hauteur sur l'interet."""
+            col = imp[:, x0:x0 + ww].sum(axis=1)
+            cy = float((col * np.arange(h)).sum() / (col.sum() + 1e-9)) / h
+            bw = max(ww * 1.6 / w, 0.3)  # assez large pour garder le contexte et la nettete
+            bh = bw * iw / ih / ratio
+            if bh > 1:
+                bh, bw = 1.0, ratio * ih / iw
+            return norm_rect(rect_px({"x": (x0 + ww / 2) / w - bw / 2, "y": cy - bh / 2, "w": bw, "h": bh},
+                                     iw, ih, ratio), iw, ih)
+        if two:
+            if out and out[-1][1] == "split" and abs(xb / w - out[-1][2]["game"]["x"]) < abs(xa / w - out[-1][2]["game"]["x"]):
+                xa, xb = xb, xa  # chaque sujet garde son panneau d'un plan a l'autre
+            r = {"game": box(xa, nw, rat["game"]), "cam": box(xb, nw, rat["cam"])}
+            g, c = r["game"], r["cam"]
+            two = min(g["x"] + g["w"], c["x"] + c["w"]) - max(g["x"], c["x"]) < 0.25 * min(g["w"], c["w"])
+        if two:  # panneaux qui se recouvrent : on verrait deux fois la meme chose
+            out.append((fs[0][0], "split", r, cut))
+        else:
+            cx = (x1 + fw_ / 2) / w
+            out.append((fs[0][0], "full", {"crop": norm_rect(compute_crop(iw, ih, cx, .5, rat["crop"]), iw, ih)}, cut))
+    # on ne garde que les vrais changements : autre mise en page, ou cadre deplace
+    keep = []
+    for t, lay, r, cut in out:
+        if keep:
+            pt, pl, pr = keep[-1]
+            moved = any(abs(r[n]["x"] - pr[n]["x"]) + abs(r[n]["y"] - pr[n]["y"]) > 0.08 for n in r if n in pr)
+            if (lay == pl and not moved) or t - pt < (1.0 if cut else 2.0):
+                continue
+        keep.append((round(t, 2), lay, r))
+    return keep[:MAX_KEYS + 1]
+
+
+def apply_director(spec, cuts):
+    """Plans du realisateur -> base du short + cadrages "a partir d'ici"."""
+    if not cuts:
+        return spec
+    _, lay, r = cuts[0]
+    return {**spec, "layout": lay, "track": False, **r,
+            "keys": [{"t": t, "layout": l, **rr} for t, l, rr in cuts[1:]]}
 
 
 # ----------------------------------------------------------------------------- themes GTA
@@ -1622,6 +1782,9 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     samples = face_samples(raw, s0, s1) if use_face else []
     spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "",
                      clip.get("hashtags", ""))
+    if opts["layout"] == "auto" and spec["layout"] == "full" and spec["theme"] != "versus":
+        # pas de facecam de streamer : le realisateur choisit plein cadre ou partage plan par plan
+        spec = apply_director(spec, director(raw, s0, s1, iw, ih, spec))
     out = voice_over(raw, rel, spec, workdir / f"{name}.mp4", samples, key)
     # pack de publication, pret a copier-coller
     tags = clip.get("hashtags", "")
@@ -1668,6 +1831,8 @@ def edit_main(args):
         sys.exit("[erreur] reglages illisibles")
     if spec["ask"]:
         spec = parse_spec(ask_edit(spec, words, dur, load_groq_key()), dur)
+    if spec.pop("auto", False):
+        spec = apply_director(spec, director(raw, *spec["trim"], *video_dims(raw), spec))
     samples = None
     if spec["track"] and spec["layout"] == "full" and not spec["keys"]:
         samples = face_samples(raw, *spec["trim"])
@@ -1887,6 +2052,27 @@ def selfcheck():
     assert all(w[2] % 2 == 0 and w[3] % 2 == 0 for th in THEMES.values()
                for k in ("full", "split", "bfull", "bsplit") for w in th[k])
     assert all(set(th["sub"]) == {"full", "split", "bfull", "bsplit"} for th in THEMES.values())
+    # realisateur : un sujet au centre -> plein cadre ; deux sujets eloignes -> partage
+    try:
+        import cv2
+        import numpy as np
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            def clip_of(xs):
+                p = pathlib.Path(td) / f"d{len(xs)}.avi"
+                vw = cv2.VideoWriter(str(p), cv2.VideoWriter_fourcc(*"MJPG"), 30, (640, 360))
+                for i in range(90):
+                    img = np.full((360, 640, 3), 40, np.uint8)
+                    for x in xs:
+                        cv2.circle(img, (int(x * 640), 180 + int(40 * math.sin(i / 5))), 45, (255, 255, 255), -1)
+                    vw.write(img)
+                vw.release()
+                return director(p, 0, 3, 640, 360, parse_spec({}, 3))
+            one, two = clip_of([.5]), clip_of([.12, .88])
+            assert one and one[0][1] == "full" and abs(one[0][2]["crop"]["x"] + one[0][2]["crop"]["w"] / 2 - .5) < .1, one
+            assert two and two[0][1] == "split", two
+    except ImportError:
+        print("[info] OpenCV absent : realisateur non teste")
     print("selfcheck OK")
     return 0
 
