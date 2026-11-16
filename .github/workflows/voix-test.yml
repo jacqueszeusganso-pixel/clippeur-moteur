@@ -41,4 +41,4 @@ jobs:
       - name: Publier
         run: |
           gh release view voix-test >/dev/null 2>&1 || gh release create voix-test --title voix-test --notes "Tests de voix off"
-          gh release upload voix-test test_enthousiaste.wav test_neutre.wav --clobber
+          gh release upload voix-test test_*.wav --clobber
