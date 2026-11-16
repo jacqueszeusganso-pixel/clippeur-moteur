@@ -35,8 +35,11 @@ def sentences(text, maxc=220):
     return out
 
 
-def speak(text, ref, out):
-    """Texte anglais -> WAV 24 kHz mono avec le timbre de `ref`."""
+def speak(text, ref, out, style=None):
+    """Texte anglais -> WAV 24 kHz mono avec le timbre de `ref`.
+    `style` : extrait d'un narrateur anglophone humain (celui de la video d'origine). Chatterbox
+    imite alors sa diction (debit, intonations) au lieu de la voix par defaut, qui sonnait IA ;
+    la conversion ne garde que le timbre de Jacques."""
     import torch
     import torchaudio
     tts, vc = _models()
@@ -44,7 +47,9 @@ def speak(text, ref, out):
     src = f"{out}.src.wav"
     parts = []
     for s in sentences(text):
-        torchaudio.save(src, tts.generate(s, exaggeration=0.75, cfg_weight=0.3), tts.sr)
+        wav = (tts.generate(s, audio_prompt_path=str(style), exaggeration=0.55, cfg_weight=0.5) if style
+               else tts.generate(s, exaggeration=0.75, cfg_weight=0.3))
+        torchaudio.save(src, wav, tts.sr)
         parts += [vc.generate(src, target_voice_path=ref), gap]
     torchaudio.save(str(out), torch.cat(parts, dim=1), tts.sr)
     return out

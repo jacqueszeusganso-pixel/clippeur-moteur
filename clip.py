@@ -371,8 +371,8 @@ def groq_post_multipart(path_endpoint, fields, file_field, filename, data, key):
         return json.loads(r.read().decode("utf-8"))
 
 
-def groq_chat(messages, key, json_mode=True):
-    payload = {"model": CHAT_MODEL, "messages": messages, "temperature": 0.4}
+def groq_chat(messages, key, json_mode=True, extra=None):
+    payload = {"model": CHAT_MODEL, "messages": messages, "temperature": 0.4, **(extra or {})}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     req = urllib.request.Request(
@@ -477,11 +477,11 @@ def chunk_lines(text, size=CHUNK_CHARS):
     return chunks + [cur] if cur else chunks
 
 
-def chat_retry(messages, key, tries=4, json_mode=True):
+def chat_retry(messages, key, tries=4, json_mode=True, extra=None):
     """groq_chat qui attend la fin de la minute quand le quota par minute est atteint."""
     for i in range(tries):
         try:
-            return groq_chat(messages, key, json_mode)
+            return groq_chat(messages, key, json_mode, extra)
         except urllib.error.HTTPError as e:
             if e.code != 429 or i == tries - 1:
                 raise
@@ -1690,7 +1690,8 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords=No
 # 3e retour de Jacques : pas de blancs, voix dynamique et heureuse qui motive, un hook fort a chaque
 # video, et les bruits du jeu (moteurs, tirs) gardes sous sa voix, sans la voix d'origine : Demucs
 # separe la voix d'origine du reste, et ce reste repasse sous la voix off, baisse quand elle parle.
-VOICE_WPS = 2.5  # mots par seconde : de quoi remplir chaque passage sans blanc (2.1 laissait 2-3 s vides)
+VOICE_WPS = 2.7  # mots par seconde : remplit les passages (2.1 laissait des blancs) ; les Reels de
+# reference parlent a 3,6-4 mots/s, Chatterbox suit moins vite sans sonner presse
 SLOT_MIN, SLOT_MAX = 3.5, 9.0  # duree d'un passage commente (s)
 MIN_TEMPO, MAX_TEMPO = 0.92, 1.08  # etirement accepte pour qu'une phrase remplisse son passage
 BED_GAIN = 0.9  # bruits du jeu quand la voix se tait (ils reprennent le dessus entre deux phrases)
@@ -1741,31 +1742,79 @@ def parse_lines(raw, n):
 
 def narration(slots, key, title=""):
     """Une phrase anglaise par passage, a la longueur du passage. Renvoie autant de lignes que de passages.
-    Reponse en texte numerote : en mode JSON, Groq refusait souvent la sortie (400 json_validate_failed)."""
-    rows = "\n".join(f'{i + 1}. [{sl["d"]:.1f} s, about {max(3, round((sl["d"] - .3) * VOICE_WPS))} words] '
+    Reponse en texte numerote : en mode JSON, Groq refusait souvent la sortie (400 json_validate_failed).
+    Style appris (2026-11-16) sur deux Reels francais d'analyse GTA 6 que Jacques trouve naturels : on parle
+    au spectateur, on pointe l'ecran, on explique chaque detail puis on reagit en deux mots, conseils concrets,
+    hook concret et non crie. Le ton "commentateur surexcite" de la v3 sonnait faux."""
+    rows = "\n".join(f'{i + 1}. [{sl["d"]:.1f} s, {slot_words(sl)} words max] '
                      f'original: {sl["said"] or "(no speech, just gameplay)"}' for i, sl in enumerate(slots))
     msg = (f"Short video titled: {title or 'GTA gameplay'}. It is cut into {len(slots)} consecutive moments; "
            f"for each one you get its length and what the original speaker says (may be any language):\n{rows}\n\n"
-           "Write the English voice-over for each moment, in order, as a hyped, super happy American gaming "
-           "creator who pumps the viewer up and explains what is happening on screen at that exact moment. "
-           "Line 1 is a scroll-stopping HOOK tied to this video: a bold claim, a shock, a secret or a question "
-           "the viewer needs answered (never 'hey guys', never 'in this video'). Every next line drops a sharp, "
-           "relevant insight about the game or what we see (why it matters, what changes, what to do), short "
-           "punchy sentences, high energy, no filler. Keep every useful fact, adapt freely (not a word-for-word "
-           "translation). Each line must FILL its moment with no dead air: use the full word count, never fewer. "
-           "Lines flow as one continuous hype commentary; the last line lands a strong payoff or a reason to "
-           "follow for more. No emoji, no hashtags, no stage directions.\n"
+           "Write the English voice-over for each moment, in order, the way a real American GTA creator talks "
+           "when he breaks the game down for his followers. It must sound like a human talking, not an AI or "
+           "an announcer. How these creators talk:\n"
+           "- They talk TO the viewer, casual and direct: 'So,', 'Now,', 'Look,', 'you guys', 'here's the thing'.\n"
+           "- They point at the screen: 'see right here', 'look at this', 'watch what happens'.\n"
+           "- They explain each detail in plain words ('that means...', 'basically...'), then react in two or "
+           "three words ('Makes sense.', 'Huge.', 'Love that.').\n"
+           "- They give concrete tips: 'if you swap your outfit after a robbery, the icon goes away'.\n"
+           "- Line 1 is a concrete hook that makes people stay, often a promise: 'Here are the mistakes you "
+           "can't make when GTA 6 drops, and at the end we max out the wanted level.' Never 'hey guys', never "
+           "'in this video', no shouting, no hype words like 'insane' or 'mind-blowing' in every line.\n"
+           "- Short spoken sentences, contractions, a little excitement when something is cool, calm otherwise.\n"
+           "- The last line asks the viewer something or tells them to follow for more GTA 6 info.\n"
+           "Do NOT just paraphrase the original line: rewrite it as spoken breakdown. Line 1 must be a NEW hook "
+           "(not the original first sentence). Use screen pointers and short reactions where they fit naturally, "
+           "in about a third of the lines, inside the sentence, never tacked on at the end ('..., look.').\n"
+           "Example. Original: 'In GTA 5 Trevor carried a minigun in a tank top.' Spoken breakdown: 'Now look at "
+           "Trevor in GTA 5, tank top, minigun, and nobody asked where he kept it. Classic.'\n"
+           "Keep every useful fact, adapt freely (not a word-for-word translation). Each line must FILL its "
+           "moment: get close to its word limit but NEVER go over it (the line is cut off when the moment ends). Lines flow as one continuous breakdown. "
+           "No emoji, no hashtags, no stage directions.\n"
            f"Answer with exactly {len(slots)} lines and nothing else, each starting with its number: "
            "\"1. ...\", \"2. ...\" and so on.")
     lines = [""] * len(slots)
     for _ in range(3):  # ligne manquante ou reponse vide : on redemande
         raw = chat_retry([{"role": "system", "content": "You write timed voice-over scripts."},
-                          {"role": "user", "content": msg}], key, json_mode=False)
+                          {"role": "user", "content": msg}], key, json_mode=False,
+                         extra={"reasoning_effort": "low", "max_completion_tokens": 6000})  # gpt-oss reflechissait jusqu a couper la reponse
         lines = parse_lines(raw, len(slots))
         if sum(1 for x in lines if x) >= len(slots) - 1:
             break
         print("[info] texte de la voix off incomplet, nouvel essai")
-    return lines
+    # Le modele ignore souvent les longueurs (24 mots pour 3,7 s) : on lui fait raccourcir les
+    # lignes trop longues, puis on coupe a la derniere virgule si ca deborde encore.
+    caps = [slot_words(sl) for sl in slots]
+    long = [i for i, (x, n) in enumerate(zip(lines, caps)) if len(x.split()) > n]
+    if long:
+        ask = "\n".join(f"{j + 1}. [max {caps[i]} words] {lines[i]}" for j, i in enumerate(long))
+        try:
+            raw = chat_retry([{"role": "user", "content":
+                               "Shorten each voice-over line to at most its word limit. Keep the same casual "
+                               "spoken tone and the key fact, drop the rest. Each must stay a natural, grammatical sentence a "
+                               "person would say out loud (keep 'so', 'you', 'look'), never telegraphic. Answer with the numbered lines "
+                               f"only, same numbers:\n{ask}"}], key, json_mode=False,
+                             extra={"reasoning_effort": "low", "max_completion_tokens": 4000})
+            for i, x in zip(long, parse_lines(raw, len(long))):
+                lines[i] = x or lines[i]
+        except (Exception, SystemExit) as e:
+            print(f"[info] raccourcissement impossible ({type(e).__name__})")
+    return [fit_words(x, n) for x, n in zip(lines, caps)]
+
+
+def slot_words(sl):
+    return max(4, round((sl["d"] - .3) * VOICE_WPS))
+
+
+def fit_words(line, n):
+    """Au plus n (+1 de tolerance) mots, coupe de preference apres une virgule ou un point."""
+    ws = line.split()
+    if len(ws) <= n + 1:
+        return line
+    for k in range(n, max(2, n // 2), -1):
+        if ws[k - 1][-1] in ",.!?;:":
+            return " ".join(ws[:k]).rstrip(",;:") + ("" if ws[k - 1][-1] in ".!?" else ".")
+    return " ".join(ws[:n]).rstrip(",;:") + "."
 
 
 def clean_tmp(tmp):
@@ -1773,19 +1822,52 @@ def clean_tmp(tmp):
         shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
 
 
-def game_sounds(video, tmp):
-    """Son du short sans la voix de la personne qui parle (Demucs, licence MIT) : moteurs, tirs,
-    musique. None si la video n'a pas de son ou si la separation echoue."""
+EN_WORDS = {"the", "and", "you", "to", "is", "it", "a", "of", "that", "in", "this", "we", "they", "so",
+            "just", "can", "be", "on", "with", "for", "your", "what", "are", "was", "but", "not"}
+
+
+def is_english(words):
+    ws = [re.sub(r"\W", "", w["word"]).lower() for w in words]
+    ws = [w for w in ws if w]
+    return len(ws) >= 15 and sum(w in EN_WORDS for w in ws) / len(ws) >= 0.2
+
+
+def separate(raw, segs, s0, s1, tmp):
+    """Son du short (blancs deja coupes, comme a l'image) separe par Demucs (licence MIT) :
+    (voix du narrateur d'origine, reste = moteurs, tirs, musique). (None, None) si impossible."""
     wav = tmp.with_name(f"{tmp.name}_src.wav")
+    af = []
+    if segs != [(s0, s1)]:
+        sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
+        af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
     try:
-        run(["ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "2", "-ar", "44100", str(wav)])
+        run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw), "-vn", *af,
+             "-ac", "2", "-ar", "44100", str(wav)])
         run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-d", "cpu",
              "-o", str(tmp.parent / f"{tmp.name}_sep"), str(wav)])
     except (Exception, SystemExit) as e:
-        print(f"[info] bruits du jeu non separes ({type(e).__name__}) : voix off seule")
+        print(f"[info] son d'origine non separe ({type(e).__name__}) : voix off seule")
+        return None, None
+    d = tmp.parent / f"{tmp.name}_sep" / "htdemucs" / wav.stem
+    voc, bed = d / "vocals.wav", d / "no_vocals.wav"
+    return (voc if voc.exists() else None), (bed if bed.exists() else None)
+
+
+def style_ref(vocals, heard, segs, tmp, length=14.0):
+    """Extrait de la voix du narrateur d'origine qui sert de modele de diction a Chatterbox (debit,
+    intonations, facon d'expliquer). Seulement s'il parle anglais : sinon son accent passerait dans
+    la voix de Jacques, et voix.py garde la voix americaine par defaut."""
+    if not (vocals and is_english(heard)):
         return None
-    bed = tmp.parent / f"{tmp.name}_sep" / "htdemucs" / wav.stem / "no_vocals.wav"
-    return bed if bed.exists() else None
+    starts = [remap(float(w["start"]), segs) for w in heard]
+    best = max(starts, key=lambda t: sum(t <= x < t + length for x in starts))  # passage le plus parle
+    out = tmp.with_name(f"{tmp.name}_style.wav")
+    try:
+        run(["ffmpeg", "-y", "-ss", f"{max(0.0, best - 0.2):.2f}", "-t", f"{length}", "-i", str(vocals),
+             "-af", "loudnorm=I=-18", "-ac", "1", "-ar", "24000", str(out)])
+    except SystemExit:
+        return None
+    return out
 
 
 def voice_over(raw, words, spec, out, samples=None, key=None):
@@ -1804,6 +1886,9 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
     tmp = out.with_name(f"_voix_{out.stem}")
     try:
         import voix
+        vocals, bed = separate(raw, segs, s0, s1, tmp)
+        style = style_ref(vocals, heard, segs, tmp)
+        print(f"    diction : {'narrateur d origine' if style else 'voix americaine par defaut'}")
         slots = voice_slots(heard, segs, dur)
         lines = narration(slots, key, spec.get("title", ""))
         print(f"    voix off : {len(slots)} passages, {sum(len(x.split()) for x in lines)} mots")
@@ -1811,7 +1896,7 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
         for i, (sl, line) in enumerate(zip(slots, lines)):
             if not line:
                 continue
-            wav = voix.speak(line, ref, tmp.with_name(f"{tmp.name}_{i:02d}.wav"))
+            wav = voix.speak(line, ref, tmp.with_name(f"{tmp.name}_{i:02d}.wav"), style)
             room = sl["d"] - 0.25  # petit souffle avant le passage suivant
             tempo = min(max(ffprobe_duration(wav) / room, MIN_TEMPO), MAX_TEMPO)
             n = len(ins) // 2
@@ -1835,7 +1920,6 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
         clean_tmp(tmp)
         return render_spec(raw, words, spec, out, samples)
     render_spec(raw, words, spec, out, samples, subwords=said or None)
-    bed = game_sounds(out, tmp)
     mixed = out.with_name(f"_mix_{out.name}")
     if bed:  # bruits du jeu sous la voix off : forts entre les phrases, effaces quand elle parle
         graph = (f"[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[vo][sc];"
@@ -2095,6 +2179,10 @@ def selfcheck():
     assert sl[0]["t"] == 0 and abs(sum(x["d"] for x in sl) - 21.0) < .05, sl  # tout le short est couvert
     assert all(SLOT_MIN - .01 <= x["d"] for x in sl[:-1]) and all(x["d"] <= SLOT_MAX + 2 for x in sl), sl
     assert voice_slots([], [(0.0, 30.0)], 30.0)[-1]["d"] > 0  # sans paroles : commente quand meme
+    en = [{"word": w} for w in "so now look at this you can see the car is gone and that is huge".split()]
+    assert is_english(en) and not is_english([{"word": w} for w in ("alors maintenant regardez la voiture " * 3).split()])
+    assert fit_words("So, look at this car, it is gone and that is huge news", 6) == "So, look at this car."
+    assert fit_words("one two three", 6) == "one two three" and len(fit_words("a " * 30, 8).split()) == 8
     assert parse_lines("Sure:\n1. Hey there.\n2) \"Look at this\"\n4. extra", 3) == ["Hey there.", "Look at this", ""]
     # couleurs et cadrages moment par moment
     r1, r2 = {"x": .1, "y": 0, "w": .3, "h": 1}, {"x": .6, "y": 0, "w": .3, "h": 1}
