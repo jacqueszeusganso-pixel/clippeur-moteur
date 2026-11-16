@@ -39,7 +39,7 @@ jobs:
       - name: Outils
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          pip install -q opencv-python-headless numpy
+          pip install -q opencv-python-headless numpy pillow
       - name: Recuperer la video
         run: |
           gh release download "job-$JOB" -p 'part_*' -D parts

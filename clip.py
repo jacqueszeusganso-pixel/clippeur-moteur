@@ -137,6 +137,7 @@ def parse_opts(raw):
         "find": re.sub(r"\s+", " ", str(d.get("find") or ""))[:200].strip(),
         "start": None, "end": None,
         "dmin": DUR_MIN, "dmax": DUR_MAX, "loop": d.get("loop", True) is not False,
+        "theme": d.get("theme") if d.get("theme") in THEMES else "none",
     }
     try:
         a, b = int(float(d["dmin"])), int(float(d["dmax"]))
@@ -677,17 +678,19 @@ def ink_on(hexc):
 
 
 def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None,
-              subs=True, color=ACCENT, subc="#FFFFFF"):
+              subs=True, color=ACCENT, subc="#FFFFFF", font="Arial Black", accent=None):
     """Sous-titres ASS : groupes de mots gros et centres, titre en haut si demande.
-    `segs` = morceaux gardes de la source ; les temps sont recales dessus."""
+    `segs` = morceaux gardes de la source ; les temps sont recales dessus.
+    `accent` : le mot le plus long de chaque groupe prend cette couleur (l'oeil s'y accroche)."""
     W, H, fs = FORMATS[fmt]
+    big = font == "Anton"  # police etroite : plus grande a lisibilite egale
     header = (
         f"[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, "
         "Bold, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n"
-        f"Style: Pop,Arial Black,{fs},{ass_color(subc)},&H00000000,&H00000000,"
-        f"-1,1,6,2,2,80,80,{round(H * .135) if margin_v is None else margin_v}\n"
+        f"Style: Pop,{font},{round(fs * 1.12) if big else fs},{ass_color(subc)},&H00000000,&H00000000,"
+        f"{0 if big else -1},1,{7 if big else 6},2,2,80,80,{round(H * .135) if margin_v is None else margin_v}\n"
         # titre : texte sur bandeau de couleur (BorderStyle 3 = boite opaque)
         f"Style: Title,Arial Black,{round(fs * .62)},{ass_color(ink_on(color))},{ass_color(color)},&H00000000,"
         f"-1,3,14,0,8,90,90,{round(H * .07)}\n\n"
@@ -703,7 +706,12 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
         chunk = win[i:i + group]
         start = remap(float(chunk[0]["start"]), segs)
         end = max(start + 0.3, remap(float(chunk[-1]["end"]), segs))
-        text = ass_text(" ".join(w["word"].strip() for w in chunk).upper())
+        ws = [ass_text(w["word"].strip().upper()) for w in chunk]
+        if accent:
+            i = max(range(len(ws)), key=lambda j: len(re.sub(r"\W", "", ws[j])))
+            if len(re.sub(r"\W", "", ws[i])) >= 4:
+                ws[i] = f"{{\\c{ass_color(accent)}}}{ws[i]}{{\\c{ass_color(subc)}}}"
+        text = " ".join(ws)
         events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(min(end, total))},Pop,,0,0,0,,{text}")
     out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return out_path
@@ -787,7 +795,12 @@ def parse_spec(d, dur):
         "color": d["color"].upper() if HEX_RE.match(str(d.get("color") or "")) else ACCENT,
         "subc": d["subc"].upper() if HEX_RE.match(str(d.get("subc") or "")) else "#FFFFFF",
         "keys": parse_keys(d.get("keys"), dur, rect),
+        "theme": d.get("theme") if d.get("theme") in THEMES else "none",
+        **{k: ass_text(str(d.get(k) or ""))[:n] for k, n in TEXTS.items()},
     }
+
+
+TEXTS = {"kicker": 40, "lab1": 20, "lab2": 20, "credit": 60, "ticker": 200}  # textes du decor
 
 
 def parse_keys(keys, dur, rect):
@@ -819,7 +832,15 @@ def plans(spec):
             for i, (a, r) in enumerate(out)]
 
 
-def auto_spec(samples, opts, iw, ih, s0, s1, title):
+def auto_spec(samples, opts, iw, ih, s0, s1, title, tags=""):
+    """Reglages de depart, habillage compris (theme choisi a la generation)."""
+    sp = base_spec(samples, opts, iw, ih, s0, s1, title)
+    sp.update(theme=opts.get("theme", "none"), kicker=gta_kicker(), lab1="", lab2="",
+              credit="", ticker=" ".join(tags.split()[:8]) or title)
+    return sp
+
+
+def base_spec(samples, opts, iw, ih, s0, s1, title):
     """Reglages de depart d'un short : ce que le moteur choisit seul, modifiable ensuite."""
     W, H, _ = FORMATS[opts["format"]]
     ht, hb = split_heights(H)
@@ -839,6 +860,432 @@ def auto_spec(samples, opts, iw, ih, s0, s1, title):
     }
 
 
+# ----------------------------------------------------------------------------- themes GTA
+# Habillages 9:16 inspires de l'univers GTA (couleurs de Vice City, etoiles de recherche,
+# ecrans de chargement). Aucun logo ni visuel de Rockstar : seulement l'esprit.
+# Fenetres = (x, y, largeur, hauteur, angle en degres) en pixels 1080x1920. "full" = une
+# fenetre (cadre unique), "split" = deux (facecam/plan 1 puis jeu/plan 2).
+# Le site garde une copie de ces fenetres (THEMES dans index.html) : les deux doivent suivre.
+FONTS = pathlib.Path(__file__).parent / "assets" / "fonts"
+PINK, ORANGE, CYAN, GOLD, PLUM = "#FF2E88", "#FF8A3D", "#2EE6F0", "#FFC83D", "#16071F"
+THEMES = {
+    "neon": {"full": [(60, 600, 960, 720, 0)], "split": [(60, 540, 960, 400, 0), (60, 960, 960, 560, 0)],
+             "sub": {"full": 1560, "split": 1700}, "accent": PINK},
+    "wanted": {"full": [(0, 0, 1080, 1920, 0)], "split": [(0, 0, 1080, 768, 0), (0, 768, 1080, 1152, 0)],
+               "sub": {"full": 1600, "split": 790}, "accent": GOLD},
+    "loading": {"full": [(80, 560, 920, 1150, -2.5)],
+                "split": [(110, 420, 860, 520, -3), (60, 1010, 960, 680, 2)],
+                "sub": {"full": 1815, "split": 1815}, "accent": GOLD},
+    "versus": {"full": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)],
+               "split": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)],
+               "sub": {"full": 1780, "split": 1780}, "accent": GOLD},
+    "news": {"full": [(0, 420, 1080, 608, 0)], "split": [(0, 150, 1080, 432, 0), (0, 582, 1080, 608, 0)],
+             "sub": {"full": 1640, "split": 1730}, "accent": "#FFD23F"},
+}
+GTA6_OUT = (2026, 11, 19)
+
+
+def gta_kicker(today=None):
+    """Pastille de serie : compte a rebours avant la sortie, puis jour N. L'envie de ne
+    pas rater l'episode du jour fait revenir les memes spectateurs."""
+    import datetime
+    d = (datetime.date(*GTA6_OUT) - (today or datetime.date.today())).days
+    if d > 1:
+        return f"GTA 6 · {d} DAYS LEFT"
+    if d == 1:
+        return "GTA 6 · OUT TOMORROW"
+    if d == 0:
+        return "GTA 6 · OUT TODAY"
+    return f"GTA 6 · DAY {1 - d}"
+
+
+def theme_windows(spec):
+    """Fenetres du theme pour ce short, ou None si pas de theme (ou format autre que 9:16)."""
+    th = THEMES.get(spec.get("theme"))
+    if not th or spec["format"] != "9:16":
+        return None
+    two = spec["theme"] == "versus" or (spec["layout"] == "split" and spec["cam"] and spec["game"])
+    return th["split" if two else "full"]
+
+
+def _font(name, size):
+    from PIL import ImageFont
+    return ImageFont.truetype(str(FONTS / name), size)
+
+
+def _rgb(hexc, a=255):
+    return tuple(int(hexc[i:i + 2], 16) for i in (1, 3, 5)) + (a,)
+
+
+def _wrap(text, font, maxw, maxlines):
+    lines, cur = [], ""
+    for w in text.upper().split():
+        t = f"{cur} {w}".strip()
+        if cur and font.getlength(t) > maxw:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = t
+    if cur:
+        lines.append(cur)
+    return lines if len(lines) <= maxlines else None
+
+
+def _fit(text, name, maxw, maxlines, size, smallest):
+    """Plus grosse taille ou le texte tient en `maxlines` lignes."""
+    while size > smallest:
+        f = _font(name, size)
+        lines = _wrap(text, f, maxw, maxlines)
+        if lines:
+            return f, lines
+        size -= 6
+    f = _font(name, smallest)
+    return f, (_wrap(text, f, maxw, 99) or [""])[:maxlines]
+
+
+def _grad(w, h, c1, c2, diag=True):
+    """Degrade c1 -> c2, en diagonale (haut-gauche -> bas-droite) ou horizontal."""
+    from PIL import Image
+    a, b = _rgb(c1), _rgb(c2)
+    ramp = Image.linear_gradient("L").rotate(90).resize((w, h))  # 0 a gauche -> 255 a droite
+    if diag:
+        ramp = Image.linear_gradient("L").rotate(45, expand=True).resize((w, h))
+        ramp = ramp.transpose(Image.Transpose.FLIP_LEFT_RIGHT).rotate(180)
+    return Image.composite(Image.new("RGBA", (w, h), b), Image.new("RGBA", (w, h), a), ramp)
+
+
+def _rot_rect(x, y, w, h, deg, pad=0):
+    """Coins d'un rectangle tourne autour de son centre (sens horaire, comme ffmpeg rotate)."""
+    cx, cy, r = x + w / 2, y + h / 2, math.radians(deg)
+    pts = []
+    for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        px, py = dx * (w / 2 + pad), dy * (h / 2 + pad)
+        pts.append((cx + px * math.cos(r) - py * math.sin(r), cy + px * math.sin(r) + py * math.cos(r)))
+    return pts
+
+
+def _star(cx, cy, ro, ri=None):
+    ri = ri or ro * .45
+    return [(cx + (ro if i % 2 == 0 else ri) * math.sin(i * math.pi / 5),
+             cy - (ro if i % 2 == 0 else ri) * math.cos(i * math.pi / 5)) for i in range(10)]
+
+
+def _text(img, xy, txt, font, fill, anchor="mm", stroke=0, stroke_fill=(0, 0, 0, 255), shadow=0):
+    from PIL import ImageDraw, ImageFilter, Image
+    if shadow:  # ombre douce : lisible sur n'importe quel plan du jeu
+        sh = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(sh).text((xy[0], xy[1] + shadow // 2), txt, font=font, fill=(0, 0, 0, 170),
+                                anchor=anchor, stroke_width=stroke, stroke_fill=(0, 0, 0, 170))
+        img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(shadow)))
+    ImageDraw.Draw(img).text(xy, txt, font=font, fill=fill, anchor=anchor,
+                             stroke_width=stroke, stroke_fill=stroke_fill)
+
+
+def _grad_text(img, xy, txt, font, c1, c2, anchor="mm", shadow=10):
+    """Texte rempli d'un degrade (dernier mot du titre : la ou l'oeil tombe)."""
+    from PIL import Image, ImageDraw
+    m = Image.new("L", img.size, 0)
+    ImageDraw.Draw(m).text(xy, txt, font=font, fill=255, anchor=anchor)
+    box = m.getbbox()
+    if not box:
+        return
+    _text(img, xy, txt, font, (0, 0, 0, 0), anchor, shadow=shadow)
+    g = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    g.paste(_grad(box[2] - box[0], box[3] - box[1], c1, c2, diag=False), box[:2])
+    img.paste(g, (0, 0), m)
+
+
+def _pill(img, cx, cy, txt, font, bg, fg, padx=28, h=None, outline=None):
+    from PIL import ImageDraw
+    w = font.getlength(txt) + 2 * padx
+    h = h or font.size * 1.5
+    ImageDraw.Draw(img).rounded_rectangle((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), h / 2,
+                                          fill=bg, outline=outline, width=4 if outline else 0)
+    _text(img, (cx, cy + font.size * .04), txt, font, fg)
+    return w
+
+
+def theme_layers(spec, wins, dur, workdir):
+    """Dessine le decor : fond (sous la video), avant-plan (par-dessus) et elements animes.
+    Renvoie (fond.png, avant.png, [(png, filtre, x, y, enable)])."""
+    from PIL import Image, ImageDraw, ImageFilter
+    W, H = 1080, 1920
+    name, two = spec["theme"], len(wins) == 2
+    bg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    fg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d_bg, d_fg = ImageDraw.Draw(bg), ImageDraw.Draw(fg)
+    title, kicker = spec.get("title") or "", spec.get("kicker") or ""
+    extras = []
+    stem = workdir / f"_{name}_{os.getpid()}"
+
+    def save(img, tag):
+        p = pathlib.Path(f"{stem}_{tag}.png")
+        img.save(p)
+        return p
+
+    def progress(x, y, w, h, c1, c2):
+        """Barre qui se remplit avec la video : l'oeil veut la voir arriver au bout."""
+        d_fg.rounded_rectangle((x, y, x + w, y + h), h / 2, fill=(255, 255, 255, 46))
+        bar = Image.new("RGBA", (2 * w, h), (0, 0, 0, 0))
+        g = _grad(w, h, c1, c2, diag=False)
+        mk = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mk).rounded_rectangle((0, 0, w - 1, h - 1), h / 2, fill=255)
+        bar.paste(g, (0, 0), mk)
+        extras.append((save(bar, "bar"), f"crop=w={w}:h={h}:x='{w}-{w}*t/{dur:.3f}':y=0", x, y, ""))
+
+    if name == "neon":
+        d_bg.rectangle((0, 0, W, H), fill=_rgb(PLUM, 175))
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        for (x, y, w, h, _), (c1, c2) in zip(wins, ((PINK, CYAN), (CYAN, PINK))):
+            frame = _grad(w + 40, h + 40, c1, c2)
+            m = Image.new("L", (w + 40, h + 40), 0)
+            ImageDraw.Draw(m).rectangle((14, 14, w + 26, h + 26), outline=255, width=12)
+            glow.paste(frame, (x - 20, y - 20), m)
+            m2 = Image.new("L", (w + 40, h + 40), 0)
+            ImageDraw.Draw(m2).rectangle((15, 15, w + 25, h + 25), outline=255, width=6)
+            fg.paste(frame, (x - 20, y - 20), m2)
+        bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(22)))
+        bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(6)))
+        top = wins[0][1]
+        if kicker:
+            _pill(fg, W / 2, 150, kicker, _font("Anton-Regular.ttf", 44), _rgb(PINK), (255, 255, 255, 255),
+                  h=76)
+        if title:
+            f, lines = _fit(title, "Anton-Regular.ttf", 920, 2, 112, 70)
+            lh = f.size * 1.08
+            y0 = (205 + top - 30) / 2 - lh * (len(lines) - 1) / 2
+            for i, ln in enumerate(lines):
+                if i == len(lines) - 1:
+                    _grad_text(fg, (W / 2, y0 + i * lh), ln, f, PINK, ORANGE)
+                else:
+                    _text(fg, (W / 2, y0 + i * lh), ln, f, (255, 255, 255, 255), shadow=10)
+        x, y, w, h, _ = wins[-1]
+        progress(x, y + h + 26, w, 10, PINK, CYAN)
+        if spec.get("credit"):
+            _text(fg, (W / 2, y + h + 70), spec["credit"].upper(), _font("BarlowCondensed-Bold.ttf", 32),
+                  (255, 255, 255, 150))
+
+    elif name == "wanted":
+        shade = Image.new("L", (1, H))  # haut et bas assombris : le texte reste lisible
+        for yy in range(H):
+            a = max(0.0, 1 - yy / 520) * 190 + max(0.0, (yy - 1380) / 540) * 200
+            shade.putpixel((0, yy), int(min(a, 210)))
+        fg.paste(Image.new("RGBA", (W, H), (0, 0, 0, 255)), (0, 0), shade.resize((W, H)))
+        stars = [(W - 92 - i * 84, 96) for i in range(5)][::-1]
+        for cx, cy in stars:
+            d_fg.polygon(_star(cx, cy, 36), fill=(0, 0, 0, 120), outline=(255, 255, 255, 230), width=4)
+        if kicker:
+            _text(fg, (60, 96), kicker, _font("Anton-Regular.ttf", 46), (255, 255, 255, 255), anchor="lm",
+                  stroke=5)
+        if title:
+            f, lines = _fit(title, "Anton-Regular.ttf", 960, 3, 124, 76)
+            lh = f.size * 1.1
+            for i, ln in enumerate(lines):
+                last = i == len(lines) - 1
+                _text(fg, (W / 2, 250 + i * lh), ln, f, _rgb(GOLD) if last else (255, 255, 255, 255),
+                      stroke=9, shadow=12)
+        # etoiles qui s'allument au fil du clip : on reste pour voir la 5e
+        for i, (cx, cy) in enumerate(stars):
+            s = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(s)
+            sd.polygon(_star(48, 48, 40), fill=(0, 0, 0, 255))
+            sd.polygon(_star(48, 48, 34), fill=_rgb(GOLD))
+            t0 = dur * (i + 1) / 6.5
+            extras.append((save(s, f"star{i}"), "", cx - 48, cy - 48, f"gte(t,{t0:.2f})"))
+        # recompense de fin : boucle bouclee, envie de relancer
+        ban = Image.new("RGBA", (W, 420), (0, 0, 0, 0))
+        ImageDraw.Draw(ban).rectangle((0, 90, W, 330), fill=(0, 0, 0, 165))
+        _text(ban, (W / 2, 185), "MISSION PASSED", _font("Anton-Regular.ttf", 150), _rgb(GOLD), stroke=8,
+              shadow=10)
+        _text(ban, (W / 2, 290), "RESPECT +", _font("Anton-Regular.ttf", 58), (255, 255, 255, 255), stroke=5)
+        extras.append((save(ban, "end"), f"fade=in:st={max(0, dur - 2.2):.2f}:d=0.25:alpha=1",
+                       0, 750, f"gte(t,{max(0, dur - 2.2):.2f})"))
+
+    elif name == "loading":
+        # affiche peinte : bandes de coucher de soleil en biais, trame BD sur les jointures
+        bands = [(0, "#FF4F9A"), (.33, "#FF8A3D"), (.62, "#FFB547"), (.84, "#1EB7C2")]
+        for i, (p, c) in enumerate(bands):
+            y0 = p * H
+            d_bg.polygon([(0, y0 - 140), (W, y0 + 140), (W, H + 300), (0, H + 300)], fill=_rgb(c))
+            for yy in range(int(y0 - 170), int(y0 + 200), 22):  # trame de points d'imprimerie
+                for xx in range(-20, W + 20, 22):
+                    k = 1 - abs((yy - (y0 - 140 + 280 * xx / W)) / 160)
+                    if k > 0:
+                        r = 2 + 5 * k
+                        d_bg.ellipse((xx - r, yy - r, xx + r, yy + r), fill=(0, 0, 0, 34))
+        for x, y, w, h, a in wins:
+            d_bg.polygon(_rot_rect(x, y, w, h, a, 26), fill=(0, 0, 0, 255))
+            d_bg.polygon(_rot_rect(x, y, w, h, a, 12), fill=(255, 255, 255, 255))
+        top = min(_rot_rect(*wins[0])[i][1] for i in range(4))
+        if title:
+            f, lines = _fit(title, "Anton-Regular.ttf", 880, 2, 104, 66)
+            lh = f.size * 1.16
+            strip = Image.new("RGBA", (W, int(lh * len(lines) + 70)), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(strip)
+            for i, ln in enumerate(lines):
+                tw = f.getlength(ln) + 56
+                cy = 35 + lh * (i + .5)
+                sd.rectangle((W / 2 - tw / 2, cy - lh / 2, W / 2 + tw / 2, cy + lh / 2), fill=(10, 10, 12, 255))
+                _text(strip, (W / 2, cy + 4), ln, f, (255, 255, 255, 255))
+            strip = strip.rotate(2, resample=Image.Resampling.BICUBIC, expand=True)
+            fg.alpha_composite(strip, (int(W / 2 - strip.width / 2), int(max(150, top - 40 - strip.height))))
+        if kicker:
+            tag = Image.new("RGBA", (W, 140), (0, 0, 0, 0))
+            _pill(tag, W / 2, 70, kicker, _font("Anton-Regular.ttf", 42), _rgb(GOLD), (10, 10, 12, 255), h=74,
+                  outline=(10, 10, 12, 255))
+            tag = tag.rotate(-3, resample=Image.Resampling.BICUBIC)
+            fg.alpha_composite(tag, (0, 40))
+
+    elif name == "versus":
+        d_bg.rectangle((0, 0, W, H), fill=(8, 8, 10, 150))
+        (x1, y1, w1, h1, _), (x2, y2, w2, h2, _) = wins
+        mid = (y1 + h1 + y2) / 2
+        d_fg.rectangle((0, mid - 9, W, mid + 9), fill=_rgb(GOLD))
+        d_fg.ellipse((W / 2 - 74, mid - 74, W / 2 + 74, mid + 74), fill=(10, 10, 12, 255), outline=_rgb(GOLD),
+                     width=8)
+        _text(fg, (W / 2, mid + 4), "VS", _font("Anton-Regular.ttf", 84), _rgb(GOLD))
+        lf = _font("Anton-Regular.ttf", 54)
+        for (x, y, w, h, _), lab, col in ((wins[0], spec.get("lab1") or "BEFORE", "#FFFFFF"),
+                                          (wins[1], spec.get("lab2") or "AFTER", PINK)):
+            tw = lf.getlength(lab.upper()) + 48
+            d_fg.rectangle((x + 30, y + 30, x + 30 + tw, y + 112), fill=(10, 10, 12, 230))
+            d_fg.rectangle((x + 30, y + 30, x + 40, y + 112), fill=_rgb(col))
+            _text(fg, (x + 30 + tw / 2 + 6, y + 73), lab.upper(), lf, _rgb(col))
+        if title:
+            f, lines = _fit(title, "Anton-Regular.ttf", 980, 2, 100, 64)
+            lh = f.size * 1.08
+            y0 = y1 / 2 - lh * (len(lines) - 1) / 2 + 6
+            for i, ln in enumerate(lines):
+                _text(fg, (W / 2, y0 + i * lh), ln, f, _rgb(GOLD) if i == len(lines) - 1 else (255, 255, 255, 255),
+                      shadow=10)
+
+    elif name == "news":
+        d_bg.rectangle((0, 0, W, H), fill=(6, 10, 22, 165))
+        x, y, w, h, _ = wins[-1]
+        top = wins[0][1]
+        red, ink = _rgb("#E5202E"), (12, 12, 14, 255)
+        bf = _font("Anton-Regular.ttf", 44)
+        d_fg.rectangle((48, top - 96, 48 + bf.getlength("LIVE") + 76, top - 30), fill=red)
+        d_fg.ellipse((66, top - 72, 86, top - 52), fill=(255, 255, 255, 255))
+        _text(fg, (102, top - 61), "LIVE", bf, (255, 255, 255, 255), anchor="lm")
+        if kicker:
+            _text(fg, (48 + bf.getlength("LIVE") + 104, top - 61), kicker, bf, (255, 255, 255, 255), anchor="lm")
+        yb = y + h
+        band = 252  # hauteur fixe (deux lignes) : l'apercu du site tombe juste
+        d_fg.rectangle((0, yb + 70, W, yb + 70 + band), fill=(246, 244, 238, 255))
+        d_fg.rectangle((0, yb + 70, 16, yb + 70 + band), fill=red)
+        if title:
+            tf, lines = _fit(title, "Anton-Regular.ttf", 960, 2, 92, 60)
+            lh = tf.size * 1.12
+            for i, ln in enumerate(lines):
+                _text(fg, (54, yb + 70 + band / 2 + lh * (i - (len(lines) - 1) / 2) + 4), ln, tf, ink,
+                      anchor="lm")
+        tagf = _font("Anton-Regular.ttf", 46)
+        d_fg.rectangle((0, yb + 6, tagf.getlength("BREAKING NEWS") + 70, yb + 72), fill=red)
+        _text(fg, (36, yb + 40), "BREAKING NEWS", tagf, (255, 255, 255, 255), anchor="lm")
+        ty = yb + 70 + band
+        d_fg.rectangle((0, ty, W, ty + 64), fill=ink)
+        tick = "   •   ".join(t for t in (spec.get("ticker") or title or "GTA 6").split()) + "   •   "
+        tkf = _font("BarlowCondensed-Bold.ttf", 40)
+        tw = int(tkf.getlength(tick))
+        strip = Image.new("RGBA", (tw * 2, 64), (0, 0, 0, 0))
+        _text(strip, (0, 33), tick + tick, tkf, _rgb("#FFD23F"), anchor="lm")
+        extras.append((save(strip, "tick"), "", f"-mod(t*150,{tw})", ty, ""))
+        progress(0, ty + 64, W, 8, "#E5202E", "#FFD23F")
+    return save(bg, "bg"), save(fg, "fg"), extras
+
+
+def theme_assets(outdir):
+    """Calques des themes sans titre ni pastille, en 270x480, pour l'apercu de l'editeur du site."""
+    from PIL import Image
+    outdir = pathlib.Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    for name, th in THEMES.items():
+        for lay in ("full", "split"):
+            sp = {"theme": name, "title": "", "kicker": "", "lab1": "", "lab2": "", "credit": "",
+                  "ticker": "#GTA6 #GTAVI #ViceCity #Leonida"}
+            bg, fg, extras = theme_layers(sp, th[lay], 10, outdir)
+            for p, tag in ((bg, "bg"), (fg, "fg")):
+                Image.open(p).resize((270, 480), Image.Resampling.LANCZOS).save(outdir / f"{name}-{lay}-{tag}.png",
+                                                                                 optimize=True)
+            for p in [bg, fg] + [e[0] for e in extras]:
+                p.unlink(missing_ok=True)
+    print(f"calques des themes dans {outdir}")
+    return 0
+
+
+def themed_vargs(spec, wins, iw, ih, segs, pre, samples, workdir):
+    """Graphe ffmpeg d'un short habille : fond flou, decor, video dans les fenetres,
+    avant-plan, animations. Renvoie (entrees en plus, filter_complex)."""
+    W, H = 1080, 1920
+    s0 = spec["trim"][0]
+    dur = sum(b - a for a, b in segs)
+    names = ["cam", "game"] if len(wins) == 2 else ["crop"]
+    if spec["theme"] == "versus" and spec["layout"] != "split":
+        names = ["crop", "crop"]  # un seul cadrage : les deux moities montrent le meme plan
+    cuts = plans(spec)
+    g, k = [], len(wins)
+
+    def region(r, n, j):
+        ww, wh = wins[j][2], wins[j][3]
+        if r.get(n):
+            return rect_px(r[n], iw, ih, ww / wh)
+        if n == "crop" and r.get("cam"):
+            return rect_px(r["cam"], iw, ih, ww / wh)
+        return compute_crop(iw, ih, .5, .5, ww / wh)
+    if len(cuts) == 1:
+        r = cuts[0][2]
+        g.append(f"[0:v]{pre}split={k}" + "".join(f"[a{j}]" for j in range(k)))
+        for j in range(k):
+            ww, wh = wins[j][2], wins[j][3]
+            if k == 1 and spec["track"] and samples:
+                cw, ch, _, _ = compute_crop(iw, ih, .5, .5, ww / wh)
+                x, y = track_crop(samples, segs, iw, ih, cw, ch)
+            else:
+                cw, ch, x, y = region(r, names[j], j)
+            g.append(f"[a{j}]crop=w={cw}:h={ch}:x='{x}':y='{y}',scale={ww}:{wh},setsar=1[w{j}]")
+    else:
+        g.append(f"[0:v]split={len(cuts)}" + "".join(f"[s{i}]" for i in range(len(cuts))))
+        for i, (a, b, r) in enumerate(cuts):
+            g.append(f"[s{i}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,split={k}"
+                     + "".join(f"[c{i}_{j}]" for j in range(k)))
+            for j in range(k):
+                cw, ch, x, y = region(r, names[j], j)
+                g.append(f"[c{i}_{j}]crop={cw}:{ch}:{x}:{y},scale={wins[j][2]}:{wins[j][3]},setsar=1[d{i}_{j}]")
+        for j in range(k):
+            g.append("".join(f"[d{i}_{j}]" for i in range(len(cuts)))
+                     + f"concat=n={len(cuts)}:v=1:a=0,{pre or 'null,'}null[w{j}]")
+    bg, fg, extras = theme_layers(spec, wins, dur, workdir)
+    inputs = ["-loop", "1", "-i", str(bg.resolve()), "-loop", "1", "-i", str(fg.resolve())]
+    m = k - 1  # le plan principal (jeu) sert aussi de fond flou
+    g.append(f"[w{m}]split=2[w{m}][bb]")
+    g.append(f"[bb]scale=216:384:force_original_aspect_ratio=increase,crop=216:384,boxblur=14:2,"
+             f"scale={W}:{H},eq=brightness=-0.06:saturation=1.25[base]")
+    g.append("[base][1:v]overlay=0:0:shortest=1[l0]")
+    cur = "l0"
+    for j, (x, y, w, h, a) in enumerate(wins):
+        src = f"w{j}"
+        if a:
+            g.append(f"[w{j}]format=rgba,rotate={a}*PI/180:c=none:ow=rotw({a}*PI/180):oh=roth({a}*PI/180)[r{j}]")
+            src, pos = f"r{j}", f"x='{x + w / 2:.0f}-w/2':y='{y + h / 2:.0f}-h/2'"
+        else:
+            pos = f"x={x}:y={y}"
+        g.append(f"[{cur}][{src}]overlay={pos}:shortest=1[p{j}]")
+        cur = f"p{j}"
+    g.append(f"[{cur}][2:v]overlay=0:0:shortest=1[f0]")
+    cur = "f0"
+    for n, (png, filt, x, y, en) in enumerate(extras):
+        inputs += ["-loop", "1", "-i", str(png.resolve())]
+        src = f"{3 + n}:v"
+        if filt:
+            g.append(f"[{src}]{filt}[x{n}]")
+            src = f"x{n}"
+        opt = f":enable='{en}'" if en else ""
+        g.append(f"[{cur}][{src}]overlay=x='{x}':y='{y}'{opt}:shortest=1[e{n}]")
+        cur = f"e{n}"
+    return inputs, g, cur, [bg, fg] + [e[0] for e in extras]
+
+
 def render_spec(raw, words, spec, out, samples=None):
     """Rend un short a partir de son extrait brut. `words` en temps de l'extrait."""
     iw, ih = video_dims(raw)
@@ -851,6 +1298,30 @@ def render_spec(raw, words, spec, out, samples=None):
         sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
         pre = f"select='{sel}',setpts=N/FRAME_RATE/TB,"
         af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
+    wins = theme_windows(spec)
+    if wins:  # habillage GTA : son propre graphe, le reste de la fonction ne change pas
+        th = THEMES[spec["theme"]]
+        sub_y = th["sub"]["split" if len(wins) == 2 else "full"]
+        build_ass(words, segs, subs, "9:16", "", subs=spec["subs"], subc=spec.get("subc", "#FFFFFF"),
+                  margin_v=round(H - sub_y - fs * .55), font="Anton", accent=th["accent"])
+        fonts = out.parent / "fonts"
+        fonts.mkdir(exist_ok=True)
+        for f in FONTS.glob("*.ttf"):
+            (fonts / f.name).write_bytes(f.read_bytes())
+        inputs, g, cur, tmp = themed_vargs(spec, wins, iw, ih, segs, pre, samples, out.parent)
+        g.append(f"[{cur}]subtitles={subs.name}:fontsdir=fonts,format=yuv420p[v]")
+        print(f"    habillage : {spec['theme']} ({len(wins)} fenetre(s))")
+        run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()), *inputs,
+             "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", *af,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30",
+             "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(out.parent.resolve()))
+        subs.unlink(missing_ok=True)
+        for p in tmp:
+            p.unlink(missing_ok=True)
+        for f in fonts.glob("*"):
+            f.unlink()
+        fonts.rmdir()
+        return out
     split = spec["layout"] == "split" and spec["cam"] and spec["game"] and spec["format"] in ("9:16", "4:5")
     look = {"color": spec.get("color", ACCENT), "subc": spec.get("subc", "#FFFFFF")}
     cuts = plans(spec)
@@ -927,7 +1398,8 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
            for w in words if float(w["end"]) > r0 and float(w["start"]) < r1]
     s0, s1 = clip["start"] - r0, clip["end"] - r0
     samples = face_samples(raw, s0, s1) if use_face else []
-    spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "")
+    spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "",
+                     clip.get("hashtags", ""))
     out = render_spec(raw, rel, spec, workdir / f"{name}.mp4", samples)
     # pack de publication, pret a copier-coller
     tags = clip.get("hashtags", "")
@@ -1004,10 +1476,13 @@ def main():
     ap.add_argument("--spec", default=os.environ.get("SPEC", "{}"), help="reglages JSON de l'editeur")
     ap.add_argument("--edit-out", help="fichier de sortie de l'edition")
     ap.add_argument("--selfcheck", action="store_true", help="tests internes rapides")
+    ap.add_argument("--theme-assets", help="ecrit les calques d'apercu des themes dans ce dossier")
     args = ap.parse_args()
 
     if args.selfcheck:
         return selfcheck()
+    if args.theme_assets:
+        return theme_assets(args.theme_assets)
     if args.edit:
         if not (args.meta and args.raw and args.edit_out):
             ap.error("--edit demande --meta, --raw et --edit-out")
@@ -1161,6 +1636,20 @@ def selfcheck():
           {"start": 60, "end": 80, "score": 50}]
     assert [c["score"] for c in best_distinct(cl, 3)] == [90, 50]
     assert slugify("J'achète un supermarché !") == "jachete-un-supermarche"
+    # habillages : compte a rebours, reglages valides, fenetres selon la mise en page
+    import datetime
+    assert gta_kicker(datetime.date(2026, 11, 16)) == "GTA 6 · 3 DAYS LEFT"
+    assert gta_kicker(datetime.date(2026, 11, 19)) == "GTA 6 · OUT TODAY"
+    assert gta_kicker(datetime.date(2026, 11, 21)) == "GTA 6 · DAY 3"
+    t = parse_spec({"theme": "neon", "kicker": "a{b}", "lab1": "x" * 50}, 10)
+    assert t["theme"] == "neon" and t["kicker"] == "a(b)" and len(t["lab1"]) == 20, t
+    assert parse_spec({"theme": "rm -rf"}, 10)["theme"] == "none"
+    assert parse_opts('{"theme":"news"}')["theme"] == "news" and parse_opts("{}")["theme"] == "none"
+    assert theme_windows(t) == THEMES["neon"]["full"]
+    assert theme_windows({**t, "layout": "split", "cam": r1, "game": r2}) == THEMES["neon"]["split"]
+    assert theme_windows({**t, "format": "4:5"}) is None and theme_windows({**t, "theme": "none"}) is None
+    assert len(theme_windows({**t, "theme": "versus"})) == 2  # toujours deux plans
+    assert all(w[2] % 2 == 0 and w[3] % 2 == 0 for th in THEMES.values() for k in ("full", "split") for w in th[k])
     print("selfcheck OK")
     return 0
 
