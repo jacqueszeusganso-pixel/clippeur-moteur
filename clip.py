@@ -1788,7 +1788,7 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
             n = len(ins) // 2
             ins += ["-i", str(wav)]
             graph.append(f"[{n}:a]atempo={tempo:.3f},atrim=end={room:.3f},"
-                         f"afade=t=out:st={max(0, room - .12):.3f}:d=.12,"
+                         f"afade=t=out:st={max(0, room - .12):.3f}:d=0.12,"
                          f"adelay={int(sl['t'] * 1000) + 120}:all=1[v{n}]")
         print(f"    voix generee en {time.time() - t:.0f} s")
         k = len(ins) // 2
