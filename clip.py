@@ -1680,13 +1680,15 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords=No
 
 
 # ----------------------------------------------------------------------------- voix off
-# Option "voice" : un commentaire anglais (americain) reecrit par Groq a partir de ce qui se dit
-# dans le short, lu avec la voix de Jacques (voix.py), pose sur le son d'origine baisse.
-# Les sous-titres suivent alors la voix off. Echantillon dechiffre par le workflow -> VOICE_REF.
-VOICE_WPS = 2.4  # mots par seconde d'un commentateur enthousiaste
-VOICE_BED = 0.15  # volume du son d'origine sous la voix off
-VOICE_LEAD = 0.25  # la voix demarre apres ce petit blanc (s)
-MAX_TEMPO = 1.25  # au-dela, la voix accelere trop pour rester naturelle
+# Option "voice" (case a cocher, jamais par defaut) : commentaire anglais americain reecrit par Groq,
+# lu avec la voix de Jacques (voix.py). Retour de Jacques apres le 1er essai (2026-11-16) : la voix
+# d'origine ne doit plus s'entendre, le debit etait trop rapide et la voix finissait avant la video.
+# Donc : son d'origine coupe, une phrase de commentaire par passage de la video, posee au moment
+# ou ce passage passe a l'ecran, et des passages qui couvrent le short jusqu'a la derniere seconde.
+# Les sous-titres suivent la voix off. Echantillon dechiffre par le workflow -> VOICE_REF.
+VOICE_WPS = 2.1  # mots par seconde : un commentateur qui explique, pas qui s'emballe (2.4 = trop vite)
+SLOT_MIN, SLOT_MAX = 3.5, 9.0  # duree d'un passage commente (s)
+MIN_TEMPO, MAX_TEMPO = 0.9, 1.12  # etirement accepte pour qu'une phrase remplisse son passage
 
 
 def unremap(t, segs):
@@ -1699,19 +1701,44 @@ def unremap(t, segs):
     return segs[-1][1]
 
 
-def narration(words, dur, key, title=""):
-    """Ce qui se dit dans le short (n'importe quelle langue) -> commentaire anglais a dire en `dur` s."""
-    n = max(8, int((dur - VOICE_LEAD) * VOICE_WPS))
-    said = " ".join(w["word"].strip() for w in words) or "(no speech, gameplay only)"
-    msg = (f"Short video titled: {title or 'GTA gameplay'}\nWhat is said in it (may be any language):\n{said}\n\n"
-           f"Write the voice-over a hyped American YouTube Shorts commentator would say over this clip, "
-           f"in natural spoken American English. Keep every useful fact or tutorial step, adapt freely "
-           f"(not a word-for-word translation), short punchy sentences, no emoji, no hashtags, no stage "
-           f"directions. About {n} words, never more than {int(n * 1.1)}. "
-           'Answer STRICTLY in JSON: {"text": "..."}')
-    raw = chat_retry([{"role": "system", "content": "You write voice-over scripts. JSON only."},
+def voice_slots(heard, segs, dur):
+    """Passages a commenter, en temps du short : [{"t", "d", "said"}] qui couvrent 0..dur sans trou.
+    Coupe de preference en fin de phrase ou sur un silence de la video d'origine."""
+    slots, last_end, brk = [{"t": 0.0, "said": []}], 0.0, False
+    for w in heard:
+        t = remap(float(w["start"]), segs)
+        long = t - slots[-1]["t"]
+        if slots[-1]["said"] and (long >= SLOT_MAX or (long >= SLOT_MIN and (brk or t - last_end > 0.5))):
+            slots.append({"t": t, "said": []})
+        slots[-1]["said"].append(w["word"].strip())
+        last_end, brk = remap(float(w["end"]), segs), w["word"].strip()[-1:] in ".!?,;:"
+    while dur - slots[-1]["t"] > SLOT_MAX + SLOT_MIN:  # longue fin sans paroles : on continue a commenter
+        slots.append({"t": slots[-1]["t"] + SLOT_MAX, "said": []})
+    if len(slots) > 1 and dur - slots[-1]["t"] < 2.0:  # dernier passage trop court : fusionne
+        slots[-2]["said"] += slots.pop()["said"]
+    for i, sl in enumerate(slots):
+        sl["d"] = round((slots[i + 1]["t"] if i + 1 < len(slots) else dur) - sl["t"], 2)
+        sl["said"] = " ".join(sl["said"])
+    return slots
+
+
+def narration(slots, key, title=""):
+    """Une phrase anglaise par passage, a la longueur du passage. Renvoie autant de lignes que de passages."""
+    rows = "\n".join(f'{i + 1}. [{sl["d"]:.1f} s, about {max(3, round((sl["d"] - .3) * VOICE_WPS))} words] '
+                     f'original: {sl["said"] or "(no speech, just gameplay)"}' for i, sl in enumerate(slots))
+    msg = (f"Short video titled: {title or 'GTA gameplay'}. It is cut into {len(slots)} consecutive moments; "
+           f"for each one you get its length and what the original speaker says (may be any language):\n{rows}\n\n"
+           "Write the English voice-over for each moment, in order, as an American YouTube creator who walks "
+           "the viewer through the game and explains what is happening on screen at that exact moment "
+           "(tutorial tone: clear, warm, confident, a bit of excitement, never rushed). Keep every useful fact, "
+           "adapt freely (not a word-for-word translation). Each line must fit its moment: respect the word "
+           "count. Lines follow each other as one continuous explanation; the last line wraps up the video. "
+           "No emoji, no hashtags, no stage directions. "
+           f'Answer STRICTLY in JSON: {{"lines": [exactly {len(slots)} strings]}}')
+    raw = chat_retry([{"role": "system", "content": "You write timed voice-over scripts. JSON only."},
                       {"role": "user", "content": msg}], key)
-    return re.sub(r"\s+", " ", str(json.loads(raw).get("text") or "")).strip()
+    lines = [re.sub(r"\s+", " ", str(x)).strip() for x in (json.loads(raw).get("lines") or [])]
+    return (lines + [""] * len(slots))[:len(slots)]
 
 
 def voice_over(raw, words, spec, out, samples=None, key=None):
@@ -1730,16 +1757,28 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
     tmp = out.with_name(f"_voix_{out.stem}")
     try:
         import voix
-        text = narration(heard, dur, key, spec.get("title", ""))
-        print(f"    voix off ({len(text.split())} mots) : {text[:90]}...")
-        t = time.time()
-        speech = voix.speak(text, ref, tmp.with_suffix(".wav"))
+        slots = voice_slots(heard, segs, dur)
+        lines = narration(slots, key, spec.get("title", ""))
+        print(f"    voix off : {len(slots)} passages, {sum(len(x.split()) for x in lines)} mots")
+        t, ins, graph = time.time(), [], []
+        for i, (sl, line) in enumerate(zip(slots, lines)):
+            if not line:
+                continue
+            wav = voix.speak(line, ref, tmp.with_name(f"{tmp.name}_{i:02d}.wav"))
+            room = sl["d"] - 0.25  # petit souffle avant le passage suivant
+            tempo = min(max(ffprobe_duration(wav) / room, MIN_TEMPO), MAX_TEMPO)
+            n = len(ins) // 2
+            ins += ["-i", str(wav)]
+            graph.append(f"[{n}:a]atempo={tempo:.3f},atrim=end={room:.3f},"
+                         f"afade=t=out:st={max(0, room - .12):.3f}:d=.12,"
+                         f"adelay={int(sl['t'] * 1000) + 120}:all=1[v{n}]")
         print(f"    voix generee en {time.time() - t:.0f} s")
-        room = dur - VOICE_LEAD - 0.2
-        tempo = min(max(ffprobe_duration(speech) / room, 1.0), MAX_TEMPO)
-        fit = tmp.with_suffix(".m4a")  # calee sur le short : leger blanc, accelere si trop longue
-        run(["ffmpeg", "-y", "-i", str(speech), "-af",
-             f"atempo={tempo:.3f},adelay={int(VOICE_LEAD * 1000)}:all=1,atrim=end={dur:.3f}",
+        k = len(ins) // 2
+        fit = tmp.with_suffix(".m4a")
+        graph.append("".join(f"[v{i}]" for i in range(k))
+                     + f"amix=inputs={k}:normalize=0:duration=longest,apad=whole_dur={dur:.3f},"
+                       f"atrim=end={dur:.3f}[a]")
+        run(["ffmpeg", "-y", *ins, "-filter_complex", ";".join(graph), "-map", "[a]",
              "-ac", "1", "-ar", "24000", "-c:a", "aac", "-b:a", "128k", str(fit)])
         resp = _transcribe_one(fit.read_bytes(), key)  # horodatage des mots dits, pour les sous-titres
         said = [{"word": w["word"], "start": unremap(float(w["start"]), segs),
@@ -1750,13 +1789,9 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
             p.unlink(missing_ok=True)
         return render_spec(raw, words, spec, out, samples)
     render_spec(raw, words, spec, out, samples, subwords=said or None)
-    mixed = out.with_name(f"_mix_{out.name}")
-    has_a = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
-                            "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.strip()
-    graph = (f"[0:a]volume={VOICE_BED}[o];[o][1:a]amix=inputs=2:duration=first:normalize=0[a]" if has_a
-             else f"[1:a]apad=whole_dur={dur:.3f}[a]")
-    run(["ffmpeg", "-y", "-i", str(out), "-i", str(fit), "-filter_complex", graph, "-map", "0:v",
-         "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
+    mixed = out.with_name(f"_mix_{out.name}")  # le son d'origine (et sa voix) est remplace par la voix off
+    run(["ffmpeg", "-y", "-i", str(out), "-i", str(fit), "-map", "0:v", "-map", "1:a",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
     mixed.replace(out)
     for p in tmp.parent.glob(f"{tmp.name}*"):
         p.unlink(missing_ok=True)
@@ -2003,6 +2038,10 @@ def selfcheck():
     for t in (0.0, 0.5, 1.29, 1.31, 2.0):
         assert abs(remap(unremap(t, segs), segs) - t) < 1e-9, t
     assert unremap(99, segs) == segs[-1][1]
+    sl = voice_slots([{"word": f"w{i}.", "start": 9.0 + i, "end": 9.5 + i} for i in range(20)], [(9.0, 30.0)], 21.0)
+    assert sl[0]["t"] == 0 and abs(sum(x["d"] for x in sl) - 21.0) < .05, sl  # tout le short est couvert
+    assert all(SLOT_MIN - .01 <= x["d"] for x in sl[:-1]) and all(x["d"] <= SLOT_MAX + 2 for x in sl), sl
+    assert voice_slots([], [(0.0, 30.0)], 30.0)[-1]["d"] > 0  # sans paroles : commente quand meme
     # couleurs et cadrages moment par moment
     r1, r2 = {"x": .1, "y": 0, "w": .3, "h": 1}, {"x": .6, "y": 0, "w": .3, "h": 1}
     k = parse_spec({"trim": [2, 12], "crop": r1, "color": "#ffd60a", "subc": "rouge",
