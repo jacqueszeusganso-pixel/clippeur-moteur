@@ -1735,8 +1735,15 @@ def narration(slots, key, title=""):
            "count. Lines follow each other as one continuous explanation; the last line wraps up the video. "
            "No emoji, no hashtags, no stage directions. "
            f'Answer STRICTLY in JSON: {{"lines": [exactly {len(slots)} strings]}}')
-    raw = chat_retry([{"role": "system", "content": "You write timed voice-over scripts. JSON only."},
-                      {"role": "user", "content": msg}], key)
+    for i in range(3):  # Groq renvoie parfois 400 json_validate_failed (JSON du modele invalide) : on redemande
+        try:
+            raw = chat_retry([{"role": "system", "content": "You write timed voice-over scripts. JSON only."},
+                              {"role": "user", "content": msg}], key)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 400 or i == 2:
+                raise
+            print(f"[info] texte de la voix off refuse par Groq ({e.read().decode('utf-8', 'ignore')[:120]}), nouvel essai")
     lines = [re.sub(r"\s+", " ", str(x)).strip() for x in (json.loads(raw).get("lines") or [])]
     return (lines + [""] * len(slots))[:len(slots)]
 
