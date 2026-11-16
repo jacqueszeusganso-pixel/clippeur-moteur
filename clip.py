@@ -138,6 +138,7 @@ def parse_opts(raw):
         "start": None, "end": None,
         "dmin": DUR_MIN, "dmax": DUR_MAX, "loop": d.get("loop", True) is not False,
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
+        "bleed": d.get("bleed", True) is not False,
     }
     try:
         a, b = int(float(d["dmin"])), int(float(d["dmax"]))
@@ -796,6 +797,7 @@ def parse_spec(d, dur):
         "subc": d["subc"].upper() if HEX_RE.match(str(d.get("subc") or "")) else "#FFFFFF",
         "keys": parse_keys(d.get("keys"), dur, rect),
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
+        "bleed": d.get("bleed", True) is not False,
         **{k: ass_text(str(d.get(k) or ""))[:n] for k, n in TEXTS.items()},
     }
 
@@ -835,7 +837,7 @@ def plans(spec):
 def auto_spec(samples, opts, iw, ih, s0, s1, title, tags=""):
     """Reglages de depart, habillage compris (theme choisi a la generation)."""
     sp = base_spec(samples, opts, iw, ih, s0, s1, title)
-    sp.update(theme=opts.get("theme", "none"), kicker=gta_kicker(), lab1="", lab2="",
+    sp.update(theme=opts.get("theme", "none"), bleed=opts.get("bleed", True), kicker=gta_kicker(), lab1="", lab2="",
               credit="", ticker=" ".join(tags.split()[:8]) or title)
     return sp
 
@@ -868,19 +870,23 @@ def base_spec(samples, opts, iw, ih, s0, s1, title):
 # Le site garde une copie de ces fenetres (THEMES dans index.html) : les deux doivent suivre.
 FONTS = pathlib.Path(__file__).parent / "assets" / "fonts"
 PINK, ORANGE, CYAN, GOLD, PLUM = "#FF2E88", "#FF8A3D", "#2EE6F0", "#FFC83D", "#16071F"
+# Modes : full/split = video dans des fenetres sur un decor ; bfull/bsplit = plein ecran,
+# la video couvre tout le 9:16 et le decor se pose par-dessus.
+BLEED = {"bfull": [(0, 0, 1080, 1920, 0)], "bsplit": [(0, 0, 1080, 768, 0), (0, 768, 1080, 1152, 0)]}
+HALVES = [(0, 0, 1080, 960, 0), (0, 960, 1080, 960, 0)]
 THEMES = {
     "neon": {"full": [(60, 600, 960, 720, 0)], "split": [(60, 540, 960, 400, 0), (60, 960, 960, 560, 0)],
-             "sub": {"full": 1560, "split": 1700}, "accent": PINK},
-    "wanted": {"full": [(0, 0, 1080, 1920, 0)], "split": [(0, 0, 1080, 768, 0), (0, 768, 1080, 1152, 0)],
-               "sub": {"full": 1600, "split": 790}, "accent": GOLD},
+             **BLEED, "sub": {"full": 1560, "split": 1700, "bfull": 1560, "bsplit": 1560}, "accent": PINK},
+    "wanted": {"full": BLEED["bfull"], "split": BLEED["bsplit"], **BLEED,
+               "sub": {"full": 1600, "split": 790, "bfull": 1600, "bsplit": 790}, "accent": GOLD},
     "loading": {"full": [(80, 560, 920, 1150, -2.5)],
-                "split": [(110, 420, 860, 520, -3), (60, 1010, 960, 680, 2)],
-                "sub": {"full": 1815, "split": 1815}, "accent": GOLD},
+                "split": [(110, 420, 860, 520, -3), (60, 1010, 960, 680, 2)], **BLEED,
+                "sub": {"full": 1815, "split": 1815, "bfull": 1600, "bsplit": 1600}, "accent": GOLD},
     "versus": {"full": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)],
-               "split": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)],
-               "sub": {"full": 1780, "split": 1780}, "accent": GOLD},
+               "split": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)], "bfull": HALVES, "bsplit": HALVES,
+               "sub": {"full": 1780, "split": 1780, "bfull": 1760, "bsplit": 1760}, "accent": GOLD},
     "news": {"full": [(0, 420, 1080, 608, 0)], "split": [(0, 150, 1080, 432, 0), (0, 582, 1080, 608, 0)],
-             "sub": {"full": 1640, "split": 1730}, "accent": "#FFD23F"},
+             **BLEED, "sub": {"full": 1640, "split": 1730, "bfull": 1250, "bsplit": 1250}, "accent": "#FFD23F"},
 }
 GTA6_OUT = (2026, 11, 19)
 
@@ -899,13 +905,18 @@ def gta_kicker(today=None):
     return f"GTA 6 · DAY {1 - d}"
 
 
+def theme_mode(spec):
+    """full, split, bfull ou bsplit (b = plein ecran)."""
+    two = spec["theme"] == "versus" or (spec["layout"] == "split" and spec["cam"] and spec["game"])
+    return ("b" if spec.get("bleed", True) else "") + ("split" if two else "full")
+
+
 def theme_windows(spec):
     """Fenetres du theme pour ce short, ou None si pas de theme (ou format autre que 9:16)."""
     th = THEMES.get(spec.get("theme"))
     if not th or spec["format"] != "9:16":
         return None
-    two = spec["theme"] == "versus" or (spec["layout"] == "split" and spec["cam"] and spec["game"])
-    return th["split" if two else "full"]
+    return th[theme_mode(spec)]
 
 
 def _font(name, size):
@@ -1011,6 +1022,7 @@ def theme_layers(spec, wins, dur, workdir):
     from PIL import Image, ImageDraw, ImageFilter
     W, H = 1080, 1920
     name, two = spec["theme"], len(wins) == 2
+    bleed = wins[0][:3] == (0, 0, 1080)  # plein ecran : tout le decor passe par-dessus la video
     bg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     fg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d_bg, d_fg = ImageDraw.Draw(bg), ImageDraw.Draw(fg)
@@ -1033,20 +1045,43 @@ def theme_layers(spec, wins, dur, workdir):
         bar.paste(g, (0, 0), mk)
         extras.append((save(bar, "bar"), f"crop=w={w}:h={h}:x='{w}-{w}*t/{dur:.3f}':y=0", x, y, ""))
 
+    def shade(top_h, bottom_y, a_top=190, a_bot=200):
+        """Haut et bas assombris en fondu : le texte reste lisible sur n'importe quel plan."""
+        m = Image.new("L", (1, H))
+        for yy in range(H):
+            a = max(0.0, 1 - yy / top_h) * a_top + max(0.0, (yy - bottom_y) / (H - bottom_y)) * a_bot
+            m.putpixel((0, yy), int(min(a, 215)))
+        fg.paste(Image.new("RGBA", (W, H), (0, 0, 0, 255)), (0, 0), m.resize((W, H)))
+
+    def gutter(y):
+        """Jointure entre les deux plans en plein ecran."""
+        d_fg.rectangle((0, y - 7, W, y + 7), fill=(10, 10, 12, 255))
+
     if name == "neon":
-        d_bg.rectangle((0, 0, W, H), fill=_rgb(PLUM, 175))
         glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        for (x, y, w, h, _), (c1, c2) in zip(wins, ((PINK, CYAN), (CYAN, PINK))):
+        if bleed:  # cadre neon sur le bord de l'ecran, halo par-dessus l'image
+            shade(600, 1260)
+            rects = [(34, 34, W - 68, H - 68, 0)]
+            if two:
+                gutter(wins[1][1])
+                d_fg.rectangle((34, wins[1][1] - 3, W - 34, wins[1][1] + 3), fill=_rgb(PINK))
+        else:
+            d_bg.rectangle((0, 0, W, H), fill=_rgb(PLUM, 175))
+            rects = wins
+        strokes = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        for (x, y, w, h, _), (c1, c2) in zip(rects, ((PINK, CYAN), (CYAN, PINK))):
             frame = _grad(w + 40, h + 40, c1, c2)
             m = Image.new("L", (w + 40, h + 40), 0)
             ImageDraw.Draw(m).rectangle((14, 14, w + 26, h + 26), outline=255, width=12)
             glow.paste(frame, (x - 20, y - 20), m)
             m2 = Image.new("L", (w + 40, h + 40), 0)
             ImageDraw.Draw(m2).rectangle((15, 15, w + 25, h + 25), outline=255, width=6)
-            fg.paste(frame, (x - 20, y - 20), m2)
-        bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(22)))
-        bg.alpha_composite(glow.filter(ImageFilter.GaussianBlur(6)))
-        top = wins[0][1]
+            strokes.paste(frame, (x - 20, y - 20), m2)
+        under = fg if bleed else bg  # en plein ecran le halo deborde sur l'image
+        under.alpha_composite(glow.filter(ImageFilter.GaussianBlur(22)))
+        under.alpha_composite(glow.filter(ImageFilter.GaussianBlur(6)))
+        fg.alpha_composite(strokes)
+        top = 560 if bleed else wins[0][1]
         if kicker:
             _pill(fg, W / 2, 150, kicker, _font("Anton-Regular.ttf", 44), _rgb(PINK), (255, 255, 255, 255),
                   h=76)
@@ -1059,11 +1094,11 @@ def theme_layers(spec, wins, dur, workdir):
                     _grad_text(fg, (W / 2, y0 + i * lh), ln, f, PINK, ORANGE)
                 else:
                     _text(fg, (W / 2, y0 + i * lh), ln, f, (255, 255, 255, 255), shadow=10)
-        x, y, w, h, _ = wins[-1]
+        x, y, w, h, _ = (70, H - 210, W - 140, 64, 0) if bleed else wins[-1]
         progress(x, y + h + 26, w, 10, PINK, CYAN)
         if spec.get("credit"):
             _text(fg, (W / 2, y + h + 70), spec["credit"].upper(), _font("BarlowCondensed-Bold.ttf", 32),
-                  (255, 255, 255, 150))
+                  (255, 255, 255, 170))
 
     elif name == "wanted":
         shade = Image.new("L", (1, H))  # haut et bas assombris : le texte reste lisible
@@ -1101,6 +1136,29 @@ def theme_layers(spec, wins, dur, workdir):
         extras.append((save(ban, "end"), f"fade=in:st={max(0, dur - 2.2):.2f}:d=0.25:alpha=1",
                        0, 750, f"gte(t,{max(0, dur - 2.2):.2f})"))
 
+    elif name == "loading" and bleed:
+        # plein ecran : la video devient la case de BD, bordure d'affiche et coins peints
+        shade(620, 1400, 150, 170)
+        corners = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        dc = ImageDraw.Draw(corners)
+        for pts, c in ((((0, 0), (300, 0), (0, 300)), "#FF4F9A"), (((W, H), (W - 340, H), (W, H - 340)), "#1EB7C2")):
+            dc.polygon(pts, fill=_rgb(c))
+        for yy in range(0, H, 20):  # trame d'imprimerie qui s'efface vers le centre
+            for xx in range(0, W, 20):
+                k = max(1 - (xx + yy) / 420, 1 - ((W - xx) + (H - yy)) / 460)
+                if k > 0:
+                    r = 1.5 + 5 * k
+                    dc.ellipse((xx - r, yy - r, xx + r, yy + r), fill=(10, 10, 12, 120))
+        fg.alpha_composite(corners)
+        if two:
+            gutter(wins[1][1])
+            d_fg.rectangle((0, wins[1][1] - 3, W, wins[1][1] + 3), fill=(255, 255, 255, 255))
+        d_fg.rectangle((0, 0, W - 1, H - 1), outline=(10, 10, 12, 255), width=30)
+        d_fg.rectangle((30, 30, W - 31, H - 31), outline=(255, 255, 255, 255), width=10)
+        lf = _font("Anton-Regular.ttf", 40)  # roue de chargement, coin bas droit comme dans le jeu
+        d_fg.arc((W - 128, H - 132, W - 78, H - 82), 40, 330, fill=(255, 255, 255, 255), width=7)
+        _text(fg, (W - 148, H - 106), "LOADING", lf, (255, 255, 255, 255), anchor="rm", stroke=4)
+        top = 470
     elif name == "loading":
         # affiche peinte : bandes de coucher de soleil en biais, trame BD sur les jointures
         bands = [(0, "#FF4F9A"), (.33, "#FF8A3D"), (.62, "#FFB547"), (.84, "#1EB7C2")]
@@ -1117,6 +1175,7 @@ def theme_layers(spec, wins, dur, workdir):
             d_bg.polygon(_rot_rect(x, y, w, h, a, 26), fill=(0, 0, 0, 255))
             d_bg.polygon(_rot_rect(x, y, w, h, a, 12), fill=(255, 255, 255, 255))
         top = min(_rot_rect(*wins[0])[i][1] for i in range(4))
+    if name == "loading":
         if title:
             f, lines = _fit(title, "Anton-Regular.ttf", 880, 2, 104, 66)
             lh = f.size * 1.16
@@ -1137,7 +1196,10 @@ def theme_layers(spec, wins, dur, workdir):
             fg.alpha_composite(tag, (0, 40))
 
     elif name == "versus":
-        d_bg.rectangle((0, 0, W, H), fill=(8, 8, 10, 150))
+        if bleed:
+            shade(430, 1560)
+        else:
+            d_bg.rectangle((0, 0, W, H), fill=(8, 8, 10, 150))
         (x1, y1, w1, h1, _), (x2, y2, w2, h2, _) = wins
         mid = (y1 + h1 + y2) / 2
         d_fg.rectangle((0, mid - 9, W, mid + 9), fill=_rgb(GOLD))
@@ -1148,21 +1210,29 @@ def theme_layers(spec, wins, dur, workdir):
         for (x, y, w, h, _), lab, col in ((wins[0], spec.get("lab1") or "BEFORE", "#FFFFFF"),
                                           (wins[1], spec.get("lab2") or "AFTER", PINK)):
             tw = lf.getlength(lab.upper()) + 48
-            d_fg.rectangle((x + 30, y + 30, x + 30 + tw, y + 112), fill=(10, 10, 12, 230))
-            d_fg.rectangle((x + 30, y + 30, x + 40, y + 112), fill=_rgb(col))
-            _text(fg, (x + 30 + tw / 2 + 6, y + 73), lab.upper(), lf, _rgb(col))
+            ly = y + h - 142 if bleed else y + 30  # plein ecran : etiquette en bas de chaque moitie
+            d_fg.rectangle((x + 30, ly, x + 30 + tw, ly + 82), fill=(10, 10, 12, 230))
+            d_fg.rectangle((x + 30, ly, x + 40, ly + 82), fill=_rgb(col))
+            _text(fg, (x + 30 + tw / 2 + 6, ly + 43), lab.upper(), lf, _rgb(col))
         if title:
             f, lines = _fit(title, "Anton-Regular.ttf", 980, 2, 100, 64)
             lh = f.size * 1.08
-            y0 = y1 / 2 - lh * (len(lines) - 1) / 2 + 6
+            y0 = (200 if bleed else y1 / 2) - lh * (len(lines) - 1) / 2 + 6
             for i, ln in enumerate(lines):
                 _text(fg, (W / 2, y0 + i * lh), ln, f, _rgb(GOLD) if i == len(lines) - 1 else (255, 255, 255, 255),
                       shadow=10)
 
     elif name == "news":
-        d_bg.rectangle((0, 0, W, H), fill=(6, 10, 22, 165))
-        x, y, w, h, _ = wins[-1]
-        top = wins[0][1]
+        if bleed:  # plein ecran : bandeau du bas pose sur l'image, LIVE en haut
+            shade(330, 1200, 170, 120)
+            x, y, w, h, _ = 0, 0, W, 1380, 0
+            top = 200
+            if two:
+                gutter(wins[1][1])
+        else:
+            d_bg.rectangle((0, 0, W, H), fill=(6, 10, 22, 165))
+            x, y, w, h, _ = wins[-1]
+            top = wins[0][1]
         red, ink = _rgb("#E5202E"), (12, 12, 14, 255)
         bf = _font("Anton-Regular.ttf", 44)
         d_fg.rectangle((48, top - 96, 48 + bf.getlength("LIVE") + 76, top - 30), fill=red)
@@ -1201,7 +1271,7 @@ def theme_assets(outdir):
     outdir = pathlib.Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     for name, th in THEMES.items():
-        for lay in ("full", "split"):
+        for lay in ("full", "split", "bfull", "bsplit"):
             sp = {"theme": name, "title": "", "kicker": "", "lab1": "", "lab2": "", "credit": "",
                   "ticker": "#GTA6 #GTAVI #ViceCity #Leonida"}
             bg, fg, extras = theme_layers(sp, th[lay], 10, outdir)
@@ -1301,7 +1371,7 @@ def render_spec(raw, words, spec, out, samples=None):
     wins = theme_windows(spec)
     if wins:  # habillage GTA : son propre graphe, le reste de la fonction ne change pas
         th = THEMES[spec["theme"]]
-        sub_y = th["sub"]["split" if len(wins) == 2 else "full"]
+        sub_y = th["sub"][theme_mode(spec)]
         build_ass(words, segs, subs, "9:16", "", subs=spec["subs"], subc=spec.get("subc", "#FFFFFF"),
                   margin_v=round(H - sub_y - fs * .55), font="Anton", accent=th["accent"])
         fonts = out.parent / "fonts"
@@ -1645,11 +1715,15 @@ def selfcheck():
     assert t["theme"] == "neon" and t["kicker"] == "a(b)" and len(t["lab1"]) == 20, t
     assert parse_spec({"theme": "rm -rf"}, 10)["theme"] == "none"
     assert parse_opts('{"theme":"news"}')["theme"] == "news" and parse_opts("{}")["theme"] == "none"
-    assert theme_windows(t) == THEMES["neon"]["full"]
-    assert theme_windows({**t, "layout": "split", "cam": r1, "game": r2}) == THEMES["neon"]["split"]
+    assert t["bleed"] and theme_windows(t) == THEMES["neon"]["bfull"]  # plein ecran par defaut
+    assert theme_windows({**t, "bleed": False}) == THEMES["neon"]["full"]
+    assert theme_windows({**t, "layout": "split", "cam": r1, "game": r2, "bleed": False}) == THEMES["neon"]["split"]
+    assert parse_opts('{"bleed":false}')["bleed"] is False and parse_spec({"bleed": 0}, 9)["bleed"]
     assert theme_windows({**t, "format": "4:5"}) is None and theme_windows({**t, "theme": "none"}) is None
     assert len(theme_windows({**t, "theme": "versus"})) == 2  # toujours deux plans
-    assert all(w[2] % 2 == 0 and w[3] % 2 == 0 for th in THEMES.values() for k in ("full", "split") for w in th[k])
+    assert all(w[2] % 2 == 0 and w[3] % 2 == 0 for th in THEMES.values()
+               for k in ("full", "split", "bfull", "bsplit") for w in th[k])
+    assert all(set(th["sub"]) == {"full", "split", "bfull", "bsplit"} for th in THEMES.values())
     print("selfcheck OK")
     return 0
 
