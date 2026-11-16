@@ -839,6 +839,27 @@ def auto_spec(samples, opts, iw, ih, s0, s1, title, tags=""):
     sp = base_spec(samples, opts, iw, ih, s0, s1, title)
     sp.update(theme=opts.get("theme", "none"), bleed=opts.get("bleed", True), kicker=gta_kicker(), lab1="", lab2="",
               credit="", ticker=" ".join(tags.split()[:8]) or title)
+    if sp["theme"] == "versus" and iw > ih:
+        sp["layout"] = "split"  # deux plans differents : le visage en haut, l'action en bas
+    wins = theme_windows(sp)
+    if wins:  # cadres a la forme des fenetres du theme, le plus large possible, centres sur le visage
+        faces = [smp for smp in samples if smp[1] is not None]
+        cx = statistics.median(f[1] for f in faces) if faces else 0.5
+        cy = statistics.median(f[2] for f in faces) if faces else 0.5
+        r0 = wins[0][2] / wins[0][3]
+        sp["crop"] = norm_rect(compute_crop(iw, ih, cx, cy, r0), iw, ih)
+        if len(wins) == 2:
+            r1 = wins[1][2] / wins[1][3]
+            if sp["theme"] == "versus":
+                cw, ch, _, _ = compute_crop(iw, ih, cx, cy, r0)
+                zw = min(cw, faces and statistics.median(f[3] for f in faces) * iw * 4 or cw * .55)
+                cam = rect_px({"x": cx - zw / iw / 2, "y": cy - zw / r0 / ih / 2, "w": zw / iw, "h": zw / r0 / ih},
+                              iw, ih, r0)
+                sp["cam"] = norm_rect(cam, iw, ih)
+                sp["game"] = norm_rect(compute_crop(iw, ih, cx, cy, r1), iw, ih)
+            else:  # vraie facecam dans un coin : on la garde, le jeu prend le reste
+                sp["cam"] = norm_rect(facecam_crop(samples, iw, ih, r0), iw, ih) if faces else sp["cam"]
+                sp["game"] = norm_rect(compute_crop(iw, ih, .5, .5, r1), iw, ih)
     return sp
 
 
@@ -875,18 +896,18 @@ PINK, ORANGE, CYAN, GOLD, PLUM = "#FF2E88", "#FF8A3D", "#2EE6F0", "#FFC83D", "#1
 BLEED = {"bfull": [(0, 0, 1080, 1920, 0)], "bsplit": [(0, 0, 1080, 768, 0), (0, 768, 1080, 1152, 0)]}
 HALVES = [(0, 0, 1080, 960, 0), (0, 960, 1080, 960, 0)]
 THEMES = {
-    "neon": {"full": [(60, 600, 960, 720, 0)], "split": [(60, 540, 960, 400, 0), (60, 960, 960, 560, 0)],
-             **BLEED, "sub": {"full": 1560, "split": 1700, "bfull": 1560, "bsplit": 1560}, "accent": PINK},
+    "neon": {"full": [(40, 360, 1000, 1240, 0)], "split": [(40, 340, 1000, 500, 0), (40, 860, 1000, 760, 0)],
+             **BLEED, "sub": {"full": 1460, "split": 1480, "bfull": 1560, "bsplit": 1560}, "accent": PINK},
     "wanted": {"full": BLEED["bfull"], "split": BLEED["bsplit"], **BLEED,
-               "sub": {"full": 1600, "split": 790, "bfull": 1600, "bsplit": 790}, "accent": GOLD},
-    "loading": {"full": [(80, 560, 920, 1150, -2.5)],
-                "split": [(110, 420, 860, 520, -3), (60, 1010, 960, 680, 2)], **BLEED,
-                "sub": {"full": 1815, "split": 1815, "bfull": 1600, "bsplit": 1600}, "accent": GOLD},
-    "versus": {"full": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)],
-               "split": [(0, 330, 1080, 760, 0), (0, 1110, 1080, 760, 0)], "bfull": HALVES, "bsplit": HALVES,
-               "sub": {"full": 1780, "split": 1780, "bfull": 1760, "bsplit": 1760}, "accent": GOLD},
-    "news": {"full": [(0, 420, 1080, 608, 0)], "split": [(0, 150, 1080, 432, 0), (0, 582, 1080, 608, 0)],
-             **BLEED, "sub": {"full": 1640, "split": 1730, "bfull": 1250, "bsplit": 1250}, "accent": "#FFD23F"},
+               "sub": {"full": 1560, "split": 1560, "bfull": 1560, "bsplit": 1560}, "accent": GOLD},
+    "loading": {"full": [(60, 420, 960, 1270, -1.5)],
+                "split": [(80, 420, 920, 500, -2), (50, 960, 980, 740, 1.5)], **BLEED,
+                "sub": {"full": 1540, "split": 1560, "bfull": 1560, "bsplit": 1560}, "accent": GOLD},
+    "versus": {"full": [(0, 260, 1080, 820, 0), (0, 1090, 1080, 820, 0)],
+               "split": [(0, 260, 1080, 820, 0), (0, 1090, 1080, 820, 0)], "bfull": HALVES, "bsplit": HALVES,
+               "sub": {"full": 1700, "split": 1700, "bfull": 1700, "bsplit": 1700}, "accent": GOLD},
+    "news": {"full": [(0, 250, 1080, 1080, 0)], "split": [(0, 230, 1080, 420, 0), (0, 650, 1080, 760, 0)],
+             **BLEED, "sub": {"full": 1200, "split": 1290, "bfull": 1300, "bsplit": 1300}, "accent": "#FFD23F"},
 }
 GTA6_OUT = (2026, 11, 19)
 
@@ -1057,10 +1078,19 @@ def theme_layers(spec, wins, dur, workdir):
         """Jointure entre les deux plans en plein ecran."""
         d_fg.rectangle((0, y - 7, W, y + 7), fill=(10, 10, 12, 255))
 
+    # La video d'abord : titre de 2 lignes au plus, tenu dans le haut de l'ecran. En ecran
+    # partage plein ecran, il se pose sur la jointure (bas de la facecam, haut du jeu) pour
+    # ne cacher ni le visage ni l'action.
+    seam = wins[1][1] if bleed and two else None
+
+    def title_lines(size, smallest, maxw=900):
+        f, lines = _fit(title, "Anton-Regular.ttf", maxw, 2, size, smallest)
+        return f, lines, f.size * 1.08
+
     if name == "neon":
         glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         if bleed:  # cadre neon sur le bord de l'ecran, halo par-dessus l'image
-            shade(600, 1260)
+            shade(380, 1500, 150, 170)
             rects = [(34, 34, W - 68, H - 68, 0)]
             if two:
                 gutter(wins[1][1])
@@ -1081,14 +1111,12 @@ def theme_layers(spec, wins, dur, workdir):
         under.alpha_composite(glow.filter(ImageFilter.GaussianBlur(22)))
         under.alpha_composite(glow.filter(ImageFilter.GaussianBlur(6)))
         fg.alpha_composite(strokes)
-        top = 560 if bleed else wins[0][1]
         if kicker:
-            _pill(fg, W / 2, 150, kicker, _font("Anton-Regular.ttf", 44), _rgb(PINK), (255, 255, 255, 255),
-                  h=76)
+            _pill(fg, W / 2, 118, kicker, _font("Anton-Regular.ttf", 34), _rgb(PINK), (255, 255, 255, 255),
+                  h=58)
         if title:
-            f, lines = _fit(title, "Anton-Regular.ttf", 920, 2, 112, 70)
-            lh = f.size * 1.08
-            y0 = (205 + top - 30) / 2 - lh * (len(lines) - 1) / 2
+            f, lines, lh = title_lines(80, 56)
+            y0 = (seam or 255) - lh * (len(lines) - 1) / 2
             for i, ln in enumerate(lines):
                 if i == len(lines) - 1:
                     _grad_text(fg, (W / 2, y0 + i * lh), ln, f, PINK, ORANGE)
@@ -1101,30 +1129,26 @@ def theme_layers(spec, wins, dur, workdir):
                   (255, 255, 255, 170))
 
     elif name == "wanted":
-        shade = Image.new("L", (1, H))  # haut et bas assombris : le texte reste lisible
-        for yy in range(H):
-            a = max(0.0, 1 - yy / 520) * 190 + max(0.0, (yy - 1380) / 540) * 200
-            shade.putpixel((0, yy), int(min(a, 210)))
-        fg.paste(Image.new("RGBA", (W, H), (0, 0, 0, 255)), (0, 0), shade.resize((W, H)))
-        stars = [(W - 92 - i * 84, 96) for i in range(5)][::-1]
+        shade(400, 1500, 150, 170)
+        stars = [(W - 80 - i * 68, 96) for i in range(5)][::-1]
         for cx, cy in stars:
-            d_fg.polygon(_star(cx, cy, 36), fill=(0, 0, 0, 120), outline=(255, 255, 255, 230), width=4)
+            d_fg.polygon(_star(cx, cy, 29), fill=(0, 0, 0, 120), outline=(255, 255, 255, 230), width=3)
         if kicker:
-            _text(fg, (60, 96), kicker, _font("Anton-Regular.ttf", 46), (255, 255, 255, 255), anchor="lm",
-                  stroke=5)
+            _text(fg, (60, 96), kicker, _font("Anton-Regular.ttf", 38), (255, 255, 255, 255), anchor="lm",
+                  stroke=4)
         if title:
-            f, lines = _fit(title, "Anton-Regular.ttf", 960, 3, 124, 76)
-            lh = f.size * 1.1
+            f, lines, lh = title_lines(84, 58, 960)
+            y0 = (seam or 250) - lh * (len(lines) - 1) / 2
             for i, ln in enumerate(lines):
                 last = i == len(lines) - 1
-                _text(fg, (W / 2, 250 + i * lh), ln, f, _rgb(GOLD) if last else (255, 255, 255, 255),
-                      stroke=9, shadow=12)
+                _text(fg, (W / 2, y0 + i * lh), ln, f, _rgb(GOLD) if last else (255, 255, 255, 255),
+                      stroke=7, shadow=12)
         # etoiles qui s'allument au fil du clip : on reste pour voir la 5e
         for i, (cx, cy) in enumerate(stars):
             s = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
             sd = ImageDraw.Draw(s)
-            sd.polygon(_star(48, 48, 40), fill=(0, 0, 0, 255))
-            sd.polygon(_star(48, 48, 34), fill=_rgb(GOLD))
+            sd.polygon(_star(48, 48, 33), fill=(0, 0, 0, 255))
+            sd.polygon(_star(48, 48, 28), fill=_rgb(GOLD))
             t0 = dur * (i + 1) / 6.5
             extras.append((save(s, f"star{i}"), "", cx - 48, cy - 48, f"gte(t,{t0:.2f})"))
         # recompense de fin : boucle bouclee, envie de relancer
@@ -1138,14 +1162,14 @@ def theme_layers(spec, wins, dur, workdir):
 
     elif name == "loading" and bleed:
         # plein ecran : la video devient la case de BD, bordure d'affiche et coins peints
-        shade(620, 1400, 150, 170)
+        shade(420, 1500, 130, 150)
         corners = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         dc = ImageDraw.Draw(corners)
-        for pts, c in ((((0, 0), (300, 0), (0, 300)), "#FF4F9A"), (((W, H), (W - 340, H), (W, H - 340)), "#1EB7C2")):
+        for pts, c in ((((0, 0), (190, 0), (0, 190)), "#FF4F9A"), (((W, H), (W - 220, H), (W, H - 220)), "#1EB7C2")):
             dc.polygon(pts, fill=_rgb(c))
         for yy in range(0, H, 20):  # trame d'imprimerie qui s'efface vers le centre
             for xx in range(0, W, 20):
-                k = max(1 - (xx + yy) / 420, 1 - ((W - xx) + (H - yy)) / 460)
+                k = max(1 - (xx + yy) / 280, 1 - ((W - xx) + (H - yy)) / 300)
                 if k > 0:
                     r = 1.5 + 5 * k
                     dc.ellipse((xx - r, yy - r, xx + r, yy + r), fill=(10, 10, 12, 120))
@@ -1158,7 +1182,6 @@ def theme_layers(spec, wins, dur, workdir):
         lf = _font("Anton-Regular.ttf", 40)  # roue de chargement, coin bas droit comme dans le jeu
         d_fg.arc((W - 128, H - 132, W - 78, H - 82), 40, 330, fill=(255, 255, 255, 255), width=7)
         _text(fg, (W - 148, H - 106), "LOADING", lf, (255, 255, 255, 255), anchor="rm", stroke=4)
-        top = 470
     elif name == "loading":
         # affiche peinte : bandes de coucher de soleil en biais, trame BD sur les jointures
         bands = [(0, "#FF4F9A"), (.33, "#FF8A3D"), (.62, "#FFB547"), (.84, "#1EB7C2")]
@@ -1174,10 +1197,9 @@ def theme_layers(spec, wins, dur, workdir):
         for x, y, w, h, a in wins:
             d_bg.polygon(_rot_rect(x, y, w, h, a, 26), fill=(0, 0, 0, 255))
             d_bg.polygon(_rot_rect(x, y, w, h, a, 12), fill=(255, 255, 255, 255))
-        top = min(_rot_rect(*wins[0])[i][1] for i in range(4))
     if name == "loading":
         if title:
-            f, lines = _fit(title, "Anton-Regular.ttf", 880, 2, 104, 66)
+            f, lines = _fit(title, "Anton-Regular.ttf", 880, 2, 70, 52)
             lh = f.size * 1.16
             strip = Image.new("RGBA", (W, int(lh * len(lines) + 70)), (0, 0, 0, 0))
             sd = ImageDraw.Draw(strip)
@@ -1187,45 +1209,45 @@ def theme_layers(spec, wins, dur, workdir):
                 sd.rectangle((W / 2 - tw / 2, cy - lh / 2, W / 2 + tw / 2, cy + lh / 2), fill=(10, 10, 12, 255))
                 _text(strip, (W / 2, cy + 4), ln, f, (255, 255, 255, 255))
             strip = strip.rotate(2, resample=Image.Resampling.BICUBIC, expand=True)
-            fg.alpha_composite(strip, (int(W / 2 - strip.width / 2), int(max(150, top - 40 - strip.height))))
+            y = seam - strip.height // 2 if seam else 200 if bleed else 132  # colle au bord haut de l'affiche
+            fg.alpha_composite(strip, (int(W / 2 - strip.width / 2), int(y)))
         if kicker:
             tag = Image.new("RGBA", (W, 140), (0, 0, 0, 0))
-            _pill(tag, W / 2, 70, kicker, _font("Anton-Regular.ttf", 42), _rgb(GOLD), (10, 10, 12, 255), h=74,
+            _pill(tag, W / 2, 70, kicker, _font("Anton-Regular.ttf", 32), _rgb(GOLD), (10, 10, 12, 255), h=56,
                   outline=(10, 10, 12, 255))
             tag = tag.rotate(-3, resample=Image.Resampling.BICUBIC)
-            fg.alpha_composite(tag, (0, 40))
+            fg.alpha_composite(tag, (0, 30 if bleed else 20))
 
     elif name == "versus":
         if bleed:
-            shade(430, 1560)
+            shade(340, 1560, 150, 150)
         else:
             d_bg.rectangle((0, 0, W, H), fill=(8, 8, 10, 150))
         (x1, y1, w1, h1, _), (x2, y2, w2, h2, _) = wins
         mid = (y1 + h1 + y2) / 2
-        d_fg.rectangle((0, mid - 9, W, mid + 9), fill=_rgb(GOLD))
-        d_fg.ellipse((W / 2 - 74, mid - 74, W / 2 + 74, mid + 74), fill=(10, 10, 12, 255), outline=_rgb(GOLD),
-                     width=8)
-        _text(fg, (W / 2, mid + 4), "VS", _font("Anton-Regular.ttf", 84), _rgb(GOLD))
-        lf = _font("Anton-Regular.ttf", 54)
+        d_fg.rectangle((0, mid - 6, W, mid + 6), fill=_rgb(GOLD))
+        d_fg.ellipse((W / 2 - 54, mid - 54, W / 2 + 54, mid + 54), fill=(10, 10, 12, 255), outline=_rgb(GOLD),
+                     width=6)
+        _text(fg, (W / 2, mid + 3), "VS", _font("Anton-Regular.ttf", 60), _rgb(GOLD))
+        lf = _font("Anton-Regular.ttf", 40)
         for (x, y, w, h, _), lab, col in ((wins[0], spec.get("lab1") or "BEFORE", "#FFFFFF"),
                                           (wins[1], spec.get("lab2") or "AFTER", PINK)):
-            tw = lf.getlength(lab.upper()) + 48
-            ly = y + h - 142 if bleed else y + 30  # plein ecran : etiquette en bas de chaque moitie
-            d_fg.rectangle((x + 30, ly, x + 30 + tw, ly + 82), fill=(10, 10, 12, 230))
-            d_fg.rectangle((x + 30, ly, x + 40, ly + 82), fill=_rgb(col))
-            _text(fg, (x + 30 + tw / 2 + 6, ly + 43), lab.upper(), lf, _rgb(col))
+            tw = lf.getlength(lab.upper()) + 40
+            ly = y + h - 110 if bleed else y + 24  # plein ecran : etiquette en bas de chaque moitie
+            d_fg.rectangle((x + 30, ly, x + 30 + tw, ly + 60), fill=(10, 10, 12, 220))
+            d_fg.rectangle((x + 30, ly, x + 38, ly + 60), fill=_rgb(col))
+            _text(fg, (x + 30 + tw / 2 + 4, ly + 32), lab.upper(), lf, _rgb(col))
         if title:
-            f, lines = _fit(title, "Anton-Regular.ttf", 980, 2, 100, 64)
-            lh = f.size * 1.08
-            y0 = (200 if bleed else y1 / 2) - lh * (len(lines) - 1) / 2 + 6
+            f, lines, lh = title_lines(76, 54, 980)
+            y0 = (190 if bleed else y1 / 2) - lh * (len(lines) - 1) / 2 + 6
             for i, ln in enumerate(lines):
                 _text(fg, (W / 2, y0 + i * lh), ln, f, _rgb(GOLD) if i == len(lines) - 1 else (255, 255, 255, 255),
                       shadow=10)
 
     elif name == "news":
         if bleed:  # plein ecran : bandeau du bas pose sur l'image, LIVE en haut
-            shade(330, 1200, 170, 120)
-            x, y, w, h, _ = 0, 0, W, 1380, 0
+            shade(300, 1300, 150, 110)
+            x, y, w, h, _ = 0, 0, W, 1440, 0
             top = 200
             if two:
                 gutter(wins[1][1])
@@ -1234,34 +1256,35 @@ def theme_layers(spec, wins, dur, workdir):
             x, y, w, h, _ = wins[-1]
             top = wins[0][1]
         red, ink = _rgb("#E5202E"), (12, 12, 14, 255)
-        bf = _font("Anton-Regular.ttf", 44)
-        d_fg.rectangle((48, top - 96, 48 + bf.getlength("LIVE") + 76, top - 30), fill=red)
-        d_fg.ellipse((66, top - 72, 86, top - 52), fill=(255, 255, 255, 255))
-        _text(fg, (102, top - 61), "LIVE", bf, (255, 255, 255, 255), anchor="lm")
+        bf = _font("Anton-Regular.ttf", 34)
+        d_fg.rectangle((48, top - 80, 48 + bf.getlength("LIVE") + 64, top - 30), fill=red)
+        d_fg.ellipse((62, top - 62, 76, top - 48), fill=(255, 255, 255, 255))
+        _text(fg, (88, top - 55), "LIVE", bf, (255, 255, 255, 255), anchor="lm")
         if kicker:
-            _text(fg, (48 + bf.getlength("LIVE") + 104, top - 61), kicker, bf, (255, 255, 255, 255), anchor="lm")
+            _text(fg, (48 + bf.getlength("LIVE") + 88, top - 55), kicker, bf, (255, 255, 255, 255), anchor="lm",
+                  shadow=6)
         yb = y + h
-        band = 252  # hauteur fixe (deux lignes) : l'apercu du site tombe juste
-        d_fg.rectangle((0, yb + 70, W, yb + 70 + band), fill=(246, 244, 238, 255))
-        d_fg.rectangle((0, yb + 70, 16, yb + 70 + band), fill=red)
+        tag, band, tick_h = 54, 180, 48  # hauteurs fixes (deux lignes) : l'apercu du site tombe juste
+        d_fg.rectangle((0, yb + tag, W, yb + tag + band), fill=(246, 244, 238, 255))
+        d_fg.rectangle((0, yb + tag, 12, yb + tag + band), fill=red)
         if title:
-            tf, lines = _fit(title, "Anton-Regular.ttf", 960, 2, 92, 60)
+            tf, lines = _fit(title, "Anton-Regular.ttf", 970, 2, 66, 48)
             lh = tf.size * 1.12
             for i, ln in enumerate(lines):
-                _text(fg, (54, yb + 70 + band / 2 + lh * (i - (len(lines) - 1) / 2) + 4), ln, tf, ink,
+                _text(fg, (46, yb + tag + band / 2 + lh * (i - (len(lines) - 1) / 2) + 3), ln, tf, ink,
                       anchor="lm")
-        tagf = _font("Anton-Regular.ttf", 46)
-        d_fg.rectangle((0, yb + 6, tagf.getlength("BREAKING NEWS") + 70, yb + 72), fill=red)
-        _text(fg, (36, yb + 40), "BREAKING NEWS", tagf, (255, 255, 255, 255), anchor="lm")
-        ty = yb + 70 + band
-        d_fg.rectangle((0, ty, W, ty + 64), fill=ink)
+        tagf = _font("Anton-Regular.ttf", 36)
+        d_fg.rectangle((0, yb + 4, tagf.getlength("BREAKING NEWS") + 56, yb + tag), fill=red)
+        _text(fg, (28, yb + 4 + (tag - 4) / 2), "BREAKING NEWS", tagf, (255, 255, 255, 255), anchor="lm")
+        ty = yb + tag + band
+        d_fg.rectangle((0, ty, W, ty + tick_h), fill=ink)
         tick = "   •   ".join(t for t in (spec.get("ticker") or title or "GTA 6").split()) + "   •   "
-        tkf = _font("BarlowCondensed-Bold.ttf", 40)
+        tkf = _font("BarlowCondensed-Bold.ttf", 32)
         tw = int(tkf.getlength(tick))
-        strip = Image.new("RGBA", (tw * 2, 64), (0, 0, 0, 0))
-        _text(strip, (0, 33), tick + tick, tkf, _rgb("#FFD23F"), anchor="lm")
+        strip = Image.new("RGBA", (tw * 2, tick_h), (0, 0, 0, 0))
+        _text(strip, (0, tick_h // 2 + 1), tick + tick, tkf, _rgb("#FFD23F"), anchor="lm")
         extras.append((save(strip, "tick"), "", f"-mod(t*150,{tw})", ty, ""))
-        progress(0, ty + 64, W, 8, "#E5202E", "#FFD23F")
+        progress(0, ty + tick_h, W, 6, "#E5202E", "#FFD23F")
     return save(bg, "bg"), save(fg, "fg"), extras
 
 
