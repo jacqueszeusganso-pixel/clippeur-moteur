@@ -139,6 +139,7 @@ def parse_opts(raw):
         "dmin": DUR_MIN, "dmax": DUR_MAX, "loop": d.get("loop", True) is not False,
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
         "bleed": d.get("bleed", True) is not False,
+        "voice": d.get("voice") is True,
     }
     try:
         a, b = int(float(d["dmin"])), int(float(d["dmax"]))
@@ -798,6 +799,7 @@ def parse_spec(d, dur):
         "keys": parse_keys(d.get("keys"), dur, rect),
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
         "bleed": d.get("bleed", True) is not False,
+        "voice": d.get("voice") is True,
         **{k: ass_text(str(d.get(k) or ""))[:n] for k, n in TEXTS.items()},
     }
 
@@ -881,7 +883,7 @@ def base_spec(samples, opts, iw, ih, s0, s1, title):
         "game": norm_rect(compute_crop(iw, ih, 0.5, 0.5, W / hb), iw, ih),
         "track": bool(faces), "trim": [round(s0, 2), round(s1, 2)],
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
-        "color": ACCENT, "subc": "#FFFFFF", "keys": [],
+        "color": ACCENT, "subc": "#FFFFFF", "keys": [], "voice": opts.get("voice", False),
     }
 
 
@@ -1381,8 +1383,10 @@ def themed_vargs(spec, wins, iw, ih, segs, pre, samples, workdir):
     return inputs, g, cur, [bg, fg] + [e[0] for e in extras]
 
 
-def render_spec(raw, words, spec, out, samples=None):
-    """Rend un short a partir de son extrait brut. `words` en temps de l'extrait."""
+def render_spec(raw, words, spec, out, samples=None, subwords=None):
+    """Rend un short a partir de son extrait brut. `words` en temps de l'extrait.
+    `subwords` : mots a sous-titrer s'ils different de ceux qu'on entend (voix off)."""
+    sw = subwords or words
     iw, ih = video_dims(raw)
     W, H, fs = FORMATS[spec["format"]]
     s0, s1 = spec["trim"]
@@ -1392,7 +1396,7 @@ def render_spec(raw, words, spec, out, samples=None):
     if spec["format"] not in ("9:16", "4:5") or iw <= ih:
         lays = ["full"] * len(cuts)
     if len(set(lays)) > 1:  # plein cadre et ecran partage alternes : une version de chaque, recollees
-        return splice_layouts(raw, words, spec, out, samples, cuts, lays, segs)
+        return splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords)
     spec = {**spec, "layout": lays[0], "keys": [{**k, "layout": lays[0]} for k in spec.get("keys") or []]}
     subs = out.with_suffix(".ass")
     pre, af = "", []
@@ -1404,7 +1408,7 @@ def render_spec(raw, words, spec, out, samples=None):
     if wins:  # habillage GTA : son propre graphe, le reste de la fonction ne change pas
         th = THEMES[spec["theme"]]
         sub_y = th["sub"][theme_mode(spec)]
-        build_ass(words, segs, subs, "9:16", "", subs=spec["subs"], subc=spec.get("subc", "#FFFFFF"),
+        build_ass(sw, segs, subs, "9:16", "", subs=spec["subs"], subc=spec.get("subc", "#FFFFFF"),
                   margin_v=round(H - sub_y - fs * .55), font="Anton", accent=th["accent"])
         fonts = out.parent / "fonts"
         fonts.mkdir(exist_ok=True)
@@ -1429,7 +1433,7 @@ def render_spec(raw, words, spec, out, samples=None):
     cuts = plans(spec)
     if len(cuts) > 1:  # cadrages valides moment par moment : un plan chacun, mis bout a bout
         ht, hb = split_heights(H)
-        build_ass(words, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look,
+        build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look,
                   margin_v=hb - round(fs * .5) if split else None)
 
         def box(r, ratio):
@@ -1454,7 +1458,7 @@ def render_spec(raw, words, spec, out, samples=None):
     elif split:
         ht, hb = split_heights(H)
         # sous-titres a cheval sur la jonction des deux panneaux
-        build_ass(words, segs, subs, spec["format"], spec["title"],
+        build_ass(sw, segs, subs, spec["format"], spec["title"],
                   margin_v=hb - round(fs * .5), subs=spec["subs"], **look)
         fw_, fh_, fx, fy = rect_px(spec["cam"], iw, ih, W / ht)
         gw, gh, gx, gy = rect_px(spec["game"], iw, ih, W / hb)
@@ -1464,7 +1468,7 @@ def render_spec(raw, words, spec, out, samples=None):
                  f"[top][bot]vstack,subtitles={subs.name}[v]")
         vargs = ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
     else:
-        build_ass(words, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look)
+        build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look)
         if spec["track"] and samples:
             cw, ch, _, _ = compute_crop(iw, ih, 0.5, 0.5, W / H)
             x, y = track_crop(samples, segs, iw, ih, cw, ch)
@@ -1483,7 +1487,7 @@ def render_spec(raw, words, spec, out, samples=None):
     return out
 
 
-def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs):
+def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords=None):
     """Short qui alterne plein cadre et ecran partage : chaque mise en page est rendue sur
     toute la duree (decor et sous-titres a leur place), puis on garde les bons morceaux."""
     s0 = spec["trim"][0]
@@ -1491,7 +1495,7 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs):
     for lay in sorted(set(lays)):
         tmp[lay] = out.with_name(f"_{lay}_{out.name}")
         render_spec(raw, words, {**spec, "layout": lay,
-                                 "keys": [{**k, "layout": lay} for k in spec["keys"]]}, tmp[lay], samples)
+                                 "keys": [{**k, "layout": lay} for k in spec["keys"]]}, tmp[lay], samples, subwords)
     order = sorted(tmp)
     pieces = []  # (mise en page, debut, fin) en temps du short final, plans voisins fusionnes
     for (a, b, _), lay in zip(cuts, lays):
@@ -1515,8 +1519,92 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs):
     return out
 
 
+# ----------------------------------------------------------------------------- voix off
+# Option "voice" : un commentaire anglais (americain) reecrit par Groq a partir de ce qui se dit
+# dans le short, lu avec la voix de Jacques (voix.py), pose sur le son d'origine baisse.
+# Les sous-titres suivent alors la voix off. Echantillon dechiffre par le workflow -> VOICE_REF.
+VOICE_WPS = 2.4  # mots par seconde d'un commentateur enthousiaste
+VOICE_BED = 0.15  # volume du son d'origine sous la voix off
+VOICE_LEAD = 0.25  # la voix demarre apres ce petit blanc (s)
+MAX_TEMPO = 1.25  # au-dela, la voix accelere trop pour rester naturelle
+
+
+def unremap(t, segs):
+    """Inverse de remap : temps dans le short final -> temps de l'extrait source."""
+    acc = 0.0
+    for a, b in segs:
+        if t <= acc + b - a:
+            return a + t - acc
+        acc += b - a
+    return segs[-1][1]
+
+
+def narration(words, dur, key, title=""):
+    """Ce qui se dit dans le short (n'importe quelle langue) -> commentaire anglais a dire en `dur` s."""
+    n = max(8, int((dur - VOICE_LEAD) * VOICE_WPS))
+    said = " ".join(w["word"].strip() for w in words) or "(no speech, gameplay only)"
+    msg = (f"Short video titled: {title or 'GTA gameplay'}\nWhat is said in it (may be any language):\n{said}\n\n"
+           f"Write the voice-over a hyped American YouTube Shorts commentator would say over this clip, "
+           f"in natural spoken American English. Keep every useful fact or tutorial step, adapt freely "
+           f"(not a word-for-word translation), short punchy sentences, no emoji, no hashtags, no stage "
+           f"directions. About {n} words, never more than {int(n * 1.1)}. "
+           'Answer STRICTLY in JSON: {"text": "..."}')
+    raw = chat_retry([{"role": "system", "content": "You write voice-over scripts. JSON only."},
+                      {"role": "user", "content": msg}], key)
+    return re.sub(r"\s+", " ", str(json.loads(raw).get("text") or "")).strip()
+
+
+def voice_over(raw, words, spec, out, samples=None, key=None):
+    """render_spec, avec la voix off de Jacques si spec["voice"]. Sans voix ou en cas de
+    souci (echantillon absent, Chatterbox pas installe), le short sort sans voix off."""
+    ref = os.environ.get("VOICE_REF", "")
+    if not spec.get("voice"):
+        return render_spec(raw, words, spec, out, samples)
+    if not (key and ref and pathlib.Path(ref).exists()):
+        print("[info] voix off demandee mais echantillon ou cle absents : short sans voix off")
+        return render_spec(raw, words, spec, out, samples)
+    s0, s1 = spec["trim"]
+    segs = keep_segments(words, s0, s1) if spec["cut"] else [(s0, s1)]
+    dur = sum(b - a for a, b in segs)
+    heard = [w for w in words if float(w["start"]) >= s0 and float(w["end"]) <= s1]
+    tmp = out.with_name(f"_voix_{out.stem}")
+    try:
+        import voix
+        text = narration(heard, dur, key, spec.get("title", ""))
+        print(f"    voix off ({len(text.split())} mots) : {text[:90]}...")
+        t = time.time()
+        speech = voix.speak(text, ref, tmp.with_suffix(".wav"))
+        print(f"    voix generee en {time.time() - t:.0f} s")
+        room = dur - VOICE_LEAD - 0.2
+        tempo = min(max(ffprobe_duration(speech) / room, 1.0), MAX_TEMPO)
+        fit = tmp.with_suffix(".m4a")  # calee sur le short : leger blanc, accelere si trop longue
+        run(["ffmpeg", "-y", "-i", str(speech), "-af",
+             f"atempo={tempo:.3f},adelay={int(VOICE_LEAD * 1000)}:all=1,atrim=end={dur:.3f}",
+             "-ac", "1", "-ar", "24000", "-c:a", "aac", "-b:a", "128k", str(fit)])
+        resp = _transcribe_one(fit.read_bytes(), key)  # horodatage des mots dits, pour les sous-titres
+        said = [{"word": w["word"], "start": unremap(float(w["start"]), segs),
+                 "end": unremap(min(float(w["end"]), dur), segs)} for w in resp.get("words") or []]
+    except (Exception, SystemExit) as e:  # la voix off ne doit jamais faire perdre le short (run -> sys.exit)
+        print(f"[info] voix off abandonnee ({type(e).__name__}: {e})")
+        for p in tmp.parent.glob(f"{tmp.name}*"):
+            p.unlink(missing_ok=True)
+        return render_spec(raw, words, spec, out, samples)
+    render_spec(raw, words, spec, out, samples, subwords=said or None)
+    mixed = out.with_name(f"_mix_{out.name}")
+    has_a = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                            "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.strip()
+    graph = (f"[0:a]volume={VOICE_BED}[o];[o][1:a]amix=inputs=2:duration=first:normalize=0[a]" if has_a
+             else f"[1:a]apad=whole_dur={dur:.3f}[a]")
+    run(["ffmpeg", "-y", "-i", str(out), "-i", str(fit), "-filter_complex", graph, "-map", "0:v",
+         "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
+    mixed.replace(out)
+    for p in tmp.parent.glob(f"{tmp.name}*"):
+        p.unlink(missing_ok=True)
+    return out
+
+
 def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=None,
-                total=None):
+                total=None, key=None):
     """Extrait brut (moment + marge) puis short. Renvoie l'entree de shorts.json."""
     opts = opts or parse_opts("{}")
     name = f"short_{index:02d}_{clip['score']:03d}_{slugify(clip['title'])}"
@@ -1534,7 +1622,7 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     samples = face_samples(raw, s0, s1) if use_face else []
     spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "",
                      clip.get("hashtags", ""))
-    out = render_spec(raw, rel, spec, workdir / f"{name}.mp4", samples)
+    out = voice_over(raw, rel, spec, workdir / f"{name}.mp4", samples, key)
     # pack de publication, pret a copier-coller
     tags = clip.get("hashtags", "")
     (workdir / f"{name}.txt").write_text(
@@ -1584,7 +1672,7 @@ def edit_main(args):
     if spec["track"] and spec["layout"] == "full" and not spec["keys"]:
         samples = face_samples(raw, *spec["trim"])
     out = pathlib.Path(args.edit_out)
-    render_spec(raw, words, spec, out, samples)
+    voice_over(raw, words, spec, out, samples, load_groq_key() if spec["voice"] else None)
     spec["ask"] = ""
     out.with_suffix(".json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     print(f"Edition prete : {out}")
@@ -1653,7 +1741,7 @@ def main():
     meta, total = [], ffprobe_duration(video)
     for i, clip in enumerate(clips, 1):
         entry = render_clip(video, words, clip, workdir, i, iw, ih,
-                            use_face=not args.no_face, opts=opts, total=total)
+                            use_face=not args.no_face, opts=opts, total=total, key=key)
         meta.append(entry)
         print(f"  - {entry['file']}  (score {clip['score']}/100)  {clip['title']}")
     (workdir / "partie.mp4").unlink(missing_ok=True)  # sinon publie avec les shorts
@@ -1743,6 +1831,13 @@ def selfcheck():
     assert a["layout"] == "split" and a["track"] and a["trim"] == [3, 20], a
     assert all(0 <= a["game"][k] <= 1 for k in "xywh"), a
     assert parse_spec(a, 30)["cam"] == a["cam"]  # ce que le moteur ecrit, l'editeur le relit
+    # voix off : option relue telle quelle, temps du short -> temps de l'extrait (inverse de remap)
+    assert parse_opts('{"voice":true}')["voice"] and not parse_opts('{"voice":"oui"}')["voice"]
+    assert auto_spec(cam, parse_opts('{"voice":true}'), 1920, 1080, 3, 20, "T")["voice"] is True
+    assert parse_spec({"voice": True}, 9)["voice"] and not parse_spec({}, 9)["voice"]
+    for t in (0.0, 0.5, 1.29, 1.31, 2.0):
+        assert abs(remap(unremap(t, segs), segs) - t) < 1e-9, t
+    assert unremap(99, segs) == segs[-1][1]
     # couleurs et cadrages moment par moment
     r1, r2 = {"x": .1, "y": 0, "w": .3, "h": 1}, {"x": .6, "y": 0, "w": .3, "h": 1}
     k = parse_spec({"trim": [2, 12], "crop": r1, "color": "#ffd60a", "subc": "rouge",

@@ -21,7 +21,7 @@ permissions:
 jobs:
   clip:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 150  # voix off : ~10 min de calcul par short
     env:
       GH_TOKEN: ${{ github.token }}
       JOB: ${{ inputs.job_id }}
@@ -40,6 +40,21 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           pip install -q opencv-python-headless numpy pillow
+      - uses: actions/cache@v4
+        if: fromJSON(inputs.opts).voice == true  # site (JSON compact) et agent du PC (json.dumps espace)
+        with:
+          path: ~/.cache/huggingface
+          key: hf-chatterbox-v1
+      - name: Voix off (Chatterbox + echantillon chiffre de Jacques)
+        if: fromJSON(inputs.opts).voice == true  # site (JSON compact) et agent du PC (json.dumps espace)
+        env:
+          VOICE_KEY: ${{ secrets.VOICE_KEY }}
+        # chatterbox impose numpy<2 : opencv 4.10 est le dernier qui l'accepte
+        run: |
+          pip install -q torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -q chatterbox-tts==0.1.7 opencv-python-headless==4.10.0.84
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:VOICE_KEY -in voix/ref.wav.enc -out "$RUNNER_TEMP/ref.wav"
+          echo "VOICE_REF=$RUNNER_TEMP/ref.wav" >> "$GITHUB_ENV"
       - name: Recuperer la video
         run: |
           gh release download "job-$JOB" -p 'part_*' -D parts

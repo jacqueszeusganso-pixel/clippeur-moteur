@@ -1,27 +1,59 @@
-# Voix off du clippeur maison : lit un texte anglais avec la voix clonee de Jacques (Chatterbox, licence MIT).
-# Usage : python voix.py REF.wav SORTIE_PREFIXE "texte"  -> SORTIE_PREFIXE_<variante>.wav
-# L'echantillon de Jacques est en francais : clone direct = accent francais herite.
-# Variante "vc" : une voix americaine native dit le texte (diction, accent, energie),
-# puis la conversion de voix remplace seulement le timbre par celui de Jacques.
-import sys, time, torchaudio
-from chatterbox.tts import ChatterboxTTS
-from chatterbox.vc import ChatterboxVC
+# Voix off du clippeur maison avec la voix clonee de Jacques (Chatterbox, licence MIT).
+# L'echantillon de Jacques est en francais : un clone direct herite de l'accent francais.
+# Donc : une voix americaine native dit le texte (diction, accent, energie), puis la
+# conversion de voix remplace seulement le timbre par celui de Jacques (choix de Jacques
+# le 2026-11-16 apres ecoute des tests).
+# Test : python voix.py REF.wav SORTIE.wav "texte anglais"
+import re
+import sys
+import time
 
-ref, out, text = sys.argv[1], sys.argv[2], sys.argv[3]
+_MODELS = None
 
 
-def step(name, fn):
+def _models():
+    """Charge une seule fois (environ 30 s) : un travail peut faire jusqu'a 6 shorts."""
+    global _MODELS
+    if _MODELS is None:
+        from chatterbox.tts import ChatterboxTTS
+        from chatterbox.vc import ChatterboxVC
+        _MODELS = ChatterboxTTS.from_pretrained(device="cpu"), ChatterboxVC.from_pretrained(device="cpu")
+    return _MODELS
+
+
+def sentences(text, maxc=220):
+    """Phrases de taille raisonnable : Chatterbox plafonne vers 40 s d'audio par appel."""
+    out = []
+    for s in re.split(r"(?<=[.!?])\s+", text.strip()):
+        while len(s) > maxc:  # phrase fleuve : coupee a la derniere virgule avant la limite
+            cut = s.rfind(",", 0, maxc)
+            cut = cut if cut > 40 else maxc
+            out.append(s[:cut + 1].strip())
+            s = s[cut + 1:].strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def speak(text, ref, out):
+    """Texte anglais -> WAV 24 kHz mono avec le timbre de `ref`."""
+    import torch
+    import torchaudio
+    tts, vc = _models()
+    gap = torch.zeros(1, int(tts.sr * 0.12))
+    src = f"{out}.src.wav"
+    parts = []
+    for s in sentences(text):
+        torchaudio.save(src, tts.generate(s, exaggeration=0.8, cfg_weight=0.3), tts.sr)
+        parts += [vc.generate(src, target_voice_path=ref), gap]
+    torchaudio.save(str(out), torch.cat(parts, dim=1), tts.sr)
+    return out
+
+
+if __name__ == "__main__":
+    assert sentences("Wow! This is it. Go.") == ["Wow!", "This is it.", "Go."]
+    long = "a" * 50 + ", " + "b" * 200 + "."
+    assert all(len(s) <= 220 for s in sentences(long)), sentences(long)
     t = time.time()
-    wav = fn()
-    torchaudio.save(f"{out}_{name}.wav", wav, tts.sr)
-    print(f"{name}: {wav.shape[-1]/tts.sr:.1f}s d'audio en {time.time()-t:.0f}s", flush=True)
-
-
-tts = ChatterboxTTS.from_pretrained(device="cpu")
-vc = ChatterboxVC.from_pretrained(device="cpu")
-# 1. clone direct, cfg tres bas (0 plante en 0.1.7) : limite l'heritage d'accent de l'echantillon (conseil Chatterbox)
-step("clone_cfg0", lambda: tts.generate(text, audio_prompt_path=ref, exaggeration=0.8, cfg_weight=0.1))
-# 2. voix americaine par defaut de Chatterbox, enthousiaste (source de la conversion)
-step("source_us", lambda: tts.generate(text, exaggeration=0.8, cfg_weight=0.3))
-# 3. conversion : accent americain de la source, timbre de Jacques
-step("vc", lambda: vc.generate(f"{out}_source_us.wav", target_voice_path=ref))
+    speak(sys.argv[3], sys.argv[1], sys.argv[2])
+    print(f"voix prete en {time.time() - t:.0f}s")
