@@ -476,11 +476,11 @@ def chunk_lines(text, size=CHUNK_CHARS):
     return chunks + [cur] if cur else chunks
 
 
-def chat_retry(messages, key, tries=4):
+def chat_retry(messages, key, tries=4, json_mode=True):
     """groq_chat qui attend la fin de la minute quand le quota par minute est atteint."""
     for i in range(tries):
         try:
-            return groq_chat(messages, key)
+            return groq_chat(messages, key, json_mode)
         except urllib.error.HTTPError as e:
             if e.code != 429 or i == tries - 1:
                 raise
@@ -1722,8 +1722,20 @@ def voice_slots(heard, segs, dur):
     return slots
 
 
+def parse_lines(raw, n):
+    """Reponse "1. texte" ligne par ligne -> n lignes dans l'ordre (vide si un numero manque)."""
+    got = {}
+    for m in re.finditer(r"^\s*(\d+)[.)]\s*(.+?)\s*$", raw, re.M):
+        k = int(m.group(1))
+        if 1 <= k <= n and k not in got:
+            t = m.group(2).replace("—", ", ").replace("–", ", ").replace("‑", "-")  # tirets longs : la voix les lit mal
+            got[k] = re.sub(r"\s+", " ", t).strip().strip('"')
+    return [got.get(k, "") for k in range(1, n + 1)]
+
+
 def narration(slots, key, title=""):
-    """Une phrase anglaise par passage, a la longueur du passage. Renvoie autant de lignes que de passages."""
+    """Une phrase anglaise par passage, a la longueur du passage. Renvoie autant de lignes que de passages.
+    Reponse en texte numerote : en mode JSON, Groq refusait souvent la sortie (400 json_validate_failed)."""
     rows = "\n".join(f'{i + 1}. [{sl["d"]:.1f} s, about {max(3, round((sl["d"] - .3) * VOICE_WPS))} words] '
                      f'original: {sl["said"] or "(no speech, just gameplay)"}' for i, sl in enumerate(slots))
     msg = (f"Short video titled: {title or 'GTA gameplay'}. It is cut into {len(slots)} consecutive moments; "
@@ -1733,19 +1745,18 @@ def narration(slots, key, title=""):
            "(tutorial tone: clear, warm, confident, a bit of excitement, never rushed). Keep every useful fact, "
            "adapt freely (not a word-for-word translation). Each line must fit its moment: respect the word "
            "count. Lines follow each other as one continuous explanation; the last line wraps up the video. "
-           "No emoji, no hashtags, no stage directions. "
-           f'Answer STRICTLY in JSON: {{"lines": [exactly {len(slots)} strings]}}')
-    for i in range(3):  # Groq renvoie parfois 400 json_validate_failed (JSON du modele invalide) : on redemande
-        try:
-            raw = chat_retry([{"role": "system", "content": "You write timed voice-over scripts. JSON only."},
-                              {"role": "user", "content": msg}], key)
+           "No emoji, no hashtags, no stage directions.\n"
+           f"Answer with exactly {len(slots)} lines and nothing else, each starting with its number: "
+           "\"1. ...\", \"2. ...\" and so on.")
+    lines = [""] * len(slots)
+    for _ in range(3):  # ligne manquante ou reponse vide : on redemande
+        raw = chat_retry([{"role": "system", "content": "You write timed voice-over scripts."},
+                          {"role": "user", "content": msg}], key, json_mode=False)
+        lines = parse_lines(raw, len(slots))
+        if sum(1 for x in lines if x) >= len(slots) - 1:
             break
-        except urllib.error.HTTPError as e:
-            if e.code != 400 or i == 2:
-                raise
-            print(f"[info] texte de la voix off refuse par Groq ({e.read().decode('utf-8', 'ignore')[:120]}), nouvel essai")
-    lines = [re.sub(r"\s+", " ", str(x)).strip() for x in (json.loads(raw).get("lines") or [])]
-    return (lines + [""] * len(slots))[:len(slots)]
+        print("[info] texte de la voix off incomplet, nouvel essai")
+    return lines
 
 
 def voice_over(raw, words, spec, out, samples=None, key=None):
@@ -2049,6 +2060,7 @@ def selfcheck():
     assert sl[0]["t"] == 0 and abs(sum(x["d"] for x in sl) - 21.0) < .05, sl  # tout le short est couvert
     assert all(SLOT_MIN - .01 <= x["d"] for x in sl[:-1]) and all(x["d"] <= SLOT_MAX + 2 for x in sl), sl
     assert voice_slots([], [(0.0, 30.0)], 30.0)[-1]["d"] > 0  # sans paroles : commente quand meme
+    assert parse_lines("Sure:\n1. Hey there.\n2) \"Look at this\"\n4. extra", 3) == ["Hey there.", "Look at this", ""]
     # couleurs et cadrages moment par moment
     r1, r2 = {"x": .1, "y": 0, "w": .3, "h": 1}, {"x": .6, "y": 0, "w": .3, "h": 1}
     k = parse_spec({"trim": [2, 12], "crop": r1, "color": "#ffd60a", "subc": "rouge",
