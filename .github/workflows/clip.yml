@@ -43,16 +43,18 @@ jobs:
       - uses: actions/cache@v4
         if: fromJSON(inputs.opts).voice == true  # site (JSON compact) et agent du PC (json.dumps espace)
         with:
-          path: ~/.cache/huggingface
-          key: hf-chatterbox-v1
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: voix-modeles-v2  # chatterbox (huggingface) + demucs (torch hub)
       - name: Voix off (Chatterbox + echantillon chiffre de Jacques)
         if: fromJSON(inputs.opts).voice == true  # site (JSON compact) et agent du PC (json.dumps espace)
         env:
           VOICE_KEY: ${{ secrets.VOICE_KEY }}
-        # chatterbox impose numpy<2 : opencv 4.10 est le dernier qui l'accepte
+        # chatterbox impose numpy<2 : opencv 4.10 est le dernier qui l accepte. demucs : bruits du jeu sans la voix d origine
         run: |
           pip install -q torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install -q chatterbox-tts==0.1.7 opencv-python-headless==4.10.0.84
+          pip install -q chatterbox-tts==0.1.7 opencv-python-headless==4.10.0.84 demucs==4.0.1
           openssl enc -d -aes-256-cbc -pbkdf2 -pass env:VOICE_KEY -in voix/ref.wav.enc -out "$RUNNER_TEMP/ref.wav"
           echo "VOICE_REF=$RUNNER_TEMP/ref.wav" >> "$GITHUB_ENV"
       - name: Recuperer la video

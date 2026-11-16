@@ -44,7 +44,7 @@ def speak(text, ref, out):
     src = f"{out}.src.wav"
     parts = []
     for s in sentences(text):
-        torchaudio.save(src, tts.generate(s, exaggeration=0.6, cfg_weight=0.3), tts.sr)
+        torchaudio.save(src, tts.generate(s, exaggeration=0.75, cfg_weight=0.3), tts.sr)
         parts += [vc.generate(src, target_voice_path=ref), gap]
     torchaudio.save(str(out), torch.cat(parts, dim=1), tts.sr)
     return out

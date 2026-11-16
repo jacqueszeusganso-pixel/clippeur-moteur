@@ -15,6 +15,7 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -1686,9 +1687,14 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords=No
 # Donc : son d'origine coupe, une phrase de commentaire par passage de la video, posee au moment
 # ou ce passage passe a l'ecran, et des passages qui couvrent le short jusqu'a la derniere seconde.
 # Les sous-titres suivent la voix off. Echantillon dechiffre par le workflow -> VOICE_REF.
-VOICE_WPS = 2.1  # mots par seconde : un commentateur qui explique, pas qui s'emballe (2.4 = trop vite)
+# 3e retour de Jacques : pas de blancs, voix dynamique et heureuse qui motive, un hook fort a chaque
+# video, et les bruits du jeu (moteurs, tirs) gardes sous sa voix, sans la voix d'origine : Demucs
+# separe la voix d'origine du reste, et ce reste repasse sous la voix off, baisse quand elle parle.
+VOICE_WPS = 2.5  # mots par seconde : de quoi remplir chaque passage sans blanc (2.1 laissait 2-3 s vides)
 SLOT_MIN, SLOT_MAX = 3.5, 9.0  # duree d'un passage commente (s)
-MIN_TEMPO, MAX_TEMPO = 0.9, 1.12  # etirement accepte pour qu'une phrase remplisse son passage
+MIN_TEMPO, MAX_TEMPO = 0.92, 1.08  # etirement accepte pour qu'une phrase remplisse son passage
+BED_GAIN = 0.9  # bruits du jeu quand la voix se tait (ils reprennent le dessus entre deux phrases)
+DUCK = "threshold=0.02:ratio=10:attack=15:release=350:makeup=1"  # quand la voix parle, le jeu s'efface
 
 
 def unremap(t, segs):
@@ -1740,12 +1746,15 @@ def narration(slots, key, title=""):
                      f'original: {sl["said"] or "(no speech, just gameplay)"}' for i, sl in enumerate(slots))
     msg = (f"Short video titled: {title or 'GTA gameplay'}. It is cut into {len(slots)} consecutive moments; "
            f"for each one you get its length and what the original speaker says (may be any language):\n{rows}\n\n"
-           "Write the English voice-over for each moment, in order, as an American YouTube creator who walks "
-           "the viewer through the game and explains what is happening on screen at that exact moment "
-           "(tutorial tone: clear, warm, confident, a bit of excitement, never rushed). Keep every useful fact, "
-           "adapt freely (not a word-for-word translation). Each line must fit its moment: respect the word "
-           "count. Lines follow each other as one continuous explanation; the last line wraps up the video. "
-           "No emoji, no hashtags, no stage directions.\n"
+           "Write the English voice-over for each moment, in order, as a hyped, super happy American gaming "
+           "creator who pumps the viewer up and explains what is happening on screen at that exact moment. "
+           "Line 1 is a scroll-stopping HOOK tied to this video: a bold claim, a shock, a secret or a question "
+           "the viewer needs answered (never 'hey guys', never 'in this video'). Every next line drops a sharp, "
+           "relevant insight about the game or what we see (why it matters, what changes, what to do), short "
+           "punchy sentences, high energy, no filler. Keep every useful fact, adapt freely (not a word-for-word "
+           "translation). Each line must FILL its moment with no dead air: use the full word count, never fewer. "
+           "Lines flow as one continuous hype commentary; the last line lands a strong payoff or a reason to "
+           "follow for more. No emoji, no hashtags, no stage directions.\n"
            f"Answer with exactly {len(slots)} lines and nothing else, each starting with its number: "
            "\"1. ...\", \"2. ...\" and so on.")
     lines = [""] * len(slots)
@@ -1757,6 +1766,26 @@ def narration(slots, key, title=""):
             break
         print("[info] texte de la voix off incomplet, nouvel essai")
     return lines
+
+
+def clean_tmp(tmp):
+    for p in tmp.parent.glob(f"{tmp.name}*"):
+        shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
+
+
+def game_sounds(video, tmp):
+    """Son du short sans la voix de la personne qui parle (Demucs, licence MIT) : moteurs, tirs,
+    musique. None si la video n'a pas de son ou si la separation echoue."""
+    wav = tmp.with_name(f"{tmp.name}_src.wav")
+    try:
+        run(["ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "2", "-ar", "44100", str(wav)])
+        run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-d", "cpu",
+             "-o", str(tmp.parent / f"{tmp.name}_sep"), str(wav)])
+    except (Exception, SystemExit) as e:
+        print(f"[info] bruits du jeu non separes ({type(e).__name__}) : voix off seule")
+        return None
+    bed = tmp.parent / f"{tmp.name}_sep" / "htdemucs" / wav.stem / "no_vocals.wav"
+    return bed if bed.exists() else None
 
 
 def voice_over(raw, words, spec, out, samples=None, key=None):
@@ -1803,16 +1832,22 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
                  "end": unremap(min(float(w["end"]), dur), segs)} for w in resp.get("words") or []]
     except (Exception, SystemExit) as e:  # la voix off ne doit jamais faire perdre le short (run -> sys.exit)
         print(f"[info] voix off abandonnee ({type(e).__name__}: {e})")
-        for p in tmp.parent.glob(f"{tmp.name}*"):
-            p.unlink(missing_ok=True)
+        clean_tmp(tmp)
         return render_spec(raw, words, spec, out, samples)
     render_spec(raw, words, spec, out, samples, subwords=said or None)
-    mixed = out.with_name(f"_mix_{out.name}")  # le son d'origine (et sa voix) est remplace par la voix off
-    run(["ffmpeg", "-y", "-i", str(out), "-i", str(fit), "-map", "0:v", "-map", "1:a",
-         "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
+    bed = game_sounds(out, tmp)
+    mixed = out.with_name(f"_mix_{out.name}")
+    if bed:  # bruits du jeu sous la voix off : forts entre les phrases, effaces quand elle parle
+        graph = (f"[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=2[vo][sc];"
+                 f"[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume={BED_GAIN}[bd];"
+                 f"[bd][sc]sidechaincompress={DUCK}[duck];[duck][vo]amix=inputs=2:normalize=0:duration=first[a]")
+        run(["ffmpeg", "-y", "-i", str(out), "-i", str(fit), "-i", str(bed), "-filter_complex", graph,
+             "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
+    else:  # separation impossible : voix off seule, jamais la voix d'origine dessous
+        run(["ffmpeg", "-y", "-i", str(out), "-i", str(fit), "-map", "0:v", "-map", "1:a",
+             "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
     mixed.replace(out)
-    for p in tmp.parent.glob(f"{tmp.name}*"):
-        p.unlink(missing_ok=True)
+    clean_tmp(tmp)
     return out
 
 
