@@ -52,6 +52,8 @@ ACCENT = "#FF4322"  # orange maison, couleur par defaut du titre
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 MAX_KEYS = 40
 DUR_MIN, DUR_MAX = 40, 90  # bornes du reglage "duree des shorts", en secondes
+DMIN_DEF = 65  # TikTok ne paie que les videos de plus d'une minute (video UNBORED, 2026-11-18)
+HOOK_MAX = 3.5  # ouverture sur la reaction : longueur max du passage repris en tete du short
 SPLIT_TOP = 0.4  # ecran partage : part de la hauteur donnee a la facecam
 EDGE = 5.0  # marge gardee autour de chaque extrait brut, pour l'allonger a l'edition
 
@@ -137,7 +139,8 @@ def parse_opts(raw):
         "layout": d.get("layout") if d.get("layout") in LAYOUTS else "auto",
         "find": re.sub(r"\s+", " ", str(d.get("find") or ""))[:200].strip(),
         "start": None, "end": None,
-        "dmin": DUR_MIN, "dmax": DUR_MAX, "loop": d.get("loop", True) is not False,
+        "dmin": DMIN_DEF, "dmax": DUR_MAX, "loop": d.get("loop", True) is not False,
+        "hook": d.get("hook", True) is not False,
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
         "bleed": d.get("bleed", True) is not False,
         "voice": d.get("voice") is True,
@@ -532,12 +535,9 @@ def fit_clip(clip, words, opts):
         nxt = ws[i + 1] if i + 1 < len(ws) else None
         gap = float(nxt["start"]) - e if nxt else 9
         sc = -abs(e - clip["end"]) / 8  # reste pres de la fin choisie par l'IA
-        if opts["loop"]:
-            sc += 1.0 if gap < .25 else -1.0 if gap > .6 else 0
-            if nxt and norm_word(nxt["word"]) == first and first:
-                sc += 3
-        else:
-            sc += 1.0 if gap > .5 else 0
+        sc += 1.0 if gap > .5 else 0  # fin sur une pause : la chute est dite, pas une idee coupee
+        if opts["loop"] and nxt and first and norm_word(nxt["word"]) == first:
+            sc += 3  # la phrase d'ouverture revient : la derniere image s'enchaine sur la premiere
         if best_sc is None or sc > best_sc:
             best, best_sc = (e, nxt), sc
     if best is None:  # pas assez de parole : on garde ce qui rentre, au plus pres de dmax
@@ -581,15 +581,23 @@ def select_in(transcript, total, key, n, cat, find, partial, opts):
         '\"title\":\"<titre accrocheur, max 60 caracteres>\",'
         '\"score\":<viralite 0-100>,\"reason\":\"<pourquoi ca marche, 1 phrase>\",'
         '\"caption\":\"<legende de post, 1-2 phrases accrocheuses>\",'
-        '\"hashtags\":[\"<4 a 6 hashtags pertinents>\"]}]}\n'
+        '\"hashtags\":[\"<4 a 6 hashtags pertinents>\"],'
+        '\"hook_text\":\"<2 a 8 mots recopies tels quels de la transcription, au moment le plus fort '
+        'de l extrait : le cri, l echec, la reaction>\"}]}\n'
         f"Regles : chaque extrait dure entre {opts['dmin']} et {opts['dmax']} secondes, start et end sont des "
         "nombres en secondes pris dans la video, les extraits ne se chevauchent pas, "
         "tries du meilleur score au moins bon. Sans aucun emoji. Rien d'autre que le JSON.\n"
+        "Ce qui fait un bon short (a respecter) :\n"
+        "- il commence sur la reaction, pas sur la mise en place : le premier mot entendu "
+        "doit deja accrocher (cri, echec, punchline), l'histoire se rattrape ensuite ;\n"
+        "- il se termine sur la chute, jamais au milieu d'une idee ;\n"
+        "- il se comprend sans avoir vu le live ni connaitre le contexte ;\n"
+        "- le score mesure la chance qu'on le regarde jusqu'au bout : un debut lent, une fin "
+        "coupee ou une blague interne font baisser le score.\n"
         + ENGLISH)
     if opts["loop"]:
-        user_msg += ("\n\nLe short sera lu en boucle : choisis une fin qui s'enchaine "
-                     "naturellement avec la premiere phrase de l'extrait, en plein elan, "
-                     "sans conclusion ni au revoir, pour que le spectateur ne voie pas la coupure.")
+        user_msg += ("\n\nLe short sera lu en boucle : apres la chute, si la premiere phrase "
+                     "de l'extrait revient juste apres dans la video, arrete-toi juste avant.")
     if CATS.get(cat):
         user_msg += "\n\nContexte : " + CATS[cat]
     if find:
@@ -642,6 +650,7 @@ def parse_clips(raw, total):
             "reason": str(c.get("reason", ""))[:200],
             "caption": str(c.get("caption", ""))[:400],
             "hashtags": str(tags or "")[:300],
+            "hook_text": str(c.get("hook_text", ""))[:120],
         })
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
@@ -705,17 +714,24 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
     events = []
     if title:
         events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(total)},Title,,0,0,0,,{ass_text(title)}")
+    # mot par mot : le groupe reste affiche, le mot prononce s'allume a l'instant ou il est dit
+    hl = accent or "#FFD60A"
+    if hl.upper() == subc.upper():
+        hl = ACCENT
+    on, off = f"{{\\c{ass_color(hl)}\\fscx110\\fscy110}}", f"{{\\c{ass_color(subc)}\\fscx100\\fscy100}}"
     for i in range(0, len(win), group):
         chunk = win[i:i + group]
-        start = remap(float(chunk[0]["start"]), segs)
-        end = max(start + 0.3, remap(float(chunk[-1]["end"]), segs))
         ws = [ass_text(w["word"].strip().upper()) for w in chunk]
-        if accent:
-            i = max(range(len(ws)), key=lambda j: len(re.sub(r"\W", "", ws[j])))
-            if len(re.sub(r"\W", "", ws[i])) >= 4:
-                ws[i] = f"{{\\c{ass_color(accent)}}}{ws[i]}{{\\c{ass_color(subc)}}}"
-        text = " ".join(ws)
-        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(min(end, total))},Pop,,0,0,0,,{text}")
+        t = [remap(float(w["start"]), segs) for w in chunk]
+        end = min(total, max(t[0] + 0.3, remap(float(chunk[-1]["end"]), segs)))
+        a = t[0]
+        for j in range(len(chunk)):
+            b = end if j == len(chunk) - 1 else max(a, min(t[j + 1], end))  # horodatages parfois en desordre
+            if b - a < .02:
+                continue
+            text = " ".join(on + x + off if k == j else x for k, x in enumerate(ws))
+            events.append(f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Pop,,0,0,0,,{text}")
+            a = b
     out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return out_path
 
@@ -1935,6 +1951,57 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
     return out
 
 
+def hook_span(words, clip):
+    """Ou se trouve, dans l'extrait, la reaction designee par l'IA (hook_text) ? Renvoie
+    (debut, fin) dans la source, ou None si introuvable ou si le short s'ouvre deja dessus."""
+    want = [x for x in (norm_word(w) for w in str(clip.get("hook_text", "")).split()) if x]
+    ws = [w for w in words if clip["start"] <= float(w["start"]) and float(w["end"]) <= clip["end"]]
+    n, best = len(want), None
+    for i in range(len(ws)):
+        hit = sum(norm_word(w["word"]) == x for w, x in zip(ws[i:i + n], want))
+        if n and hit >= max(1, -(-2 * n // 3)) and (not best or hit > best[0]):
+            best = (hit, i)
+    if not best:
+        return None
+    seg = ws[best[1]:best[1] + n]
+    a = max(clip["start"], float(seg[0]["start"]) - .15)
+    b = min(clip["end"], max(float(w["end"]) for w in seg) + .35, a + HOOK_MAX)
+    if a - clip["start"] < 3 or b - a < .8:
+        return None
+    return round(a, 2), round(b, 2)
+
+
+def hook_raw(video, raw, r0, s, hook, r1):
+    """Extrait brut avec la reaction recopiee juste avant le debut du short :
+    [marge avant] + [reaction] + [le short et la marge apres]. False si ffmpeg echoue."""
+    parts = [p for p in ((r0, s), hook, (s, r1)) if p[1] - p[0] > .05]
+    cmd = ["ffmpeg", "-y"]
+    for a, b in parts:
+        cmd += ["-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(video.resolve())]
+    g = "".join(f"[{i}:v]setpts=PTS-STARTPTS[v{i}];[{i}:a]asetpts=PTS-STARTPTS[a{i}];" for i in range(len(parts)))
+    g += "".join(f"[v{i}][a{i}]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=1[v][a]"
+    cmd += ["-filter_complex", g, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "21", "-r", "30", "-c:a", "aac", "-b:a", "160k", str(raw)]
+    ok = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode == 0
+    if not ok:
+        print("[info] ouverture sur la reaction impossible (pas de piste son ?), extrait normal")
+    return ok
+
+
+def shift_words(words, r0, s, hook, r1):
+    """Mots de la source -> temps dans l'extrait brut (meme decoupage que hook_raw)."""
+    def w_(w, t):
+        return {"word": w["word"].strip(), "start": round(float(w["start"]) + t, 2),
+                "end": round(float(w["end"]) + t, 2)}
+    if not hook:
+        return [w_(w, -r0) for w in words if float(w["end"]) > r0 and float(w["start"]) < r1]
+    ha, hb = hook
+    pre = [w_(w, -r0) for w in words if float(w["end"]) > r0 and float(w["start"]) < s]
+    mid = [w_(w, s - r0 - ha) for w in words if float(w["start"]) >= ha and float(w["end"]) <= hb]
+    post = [w_(w, hb - ha - r0) for w in words if float(w["start"]) >= s and float(w["start"]) < r1]
+    return pre + mid + post
+
+
 def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=None,
                 total=None, key=None):
     """Extrait brut (moment + marge) puis short. Renvoie l'entree de shorts.json."""
@@ -1943,14 +2010,19 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     total = total or ffprobe_duration(video)
     r0, r1 = max(0.0, clip["start"] - EDGE), min(total, clip["end"] + EDGE)
     raw = workdir / f"raw_{index:02d}.mp4"
-    # extrait reencode (coupe exacte) : c'est lui que l'editeur montre et recadre
-    run(["ffmpeg", "-y", "-ss", str(r0), "-to", str(r1), "-i", str(video.resolve()),
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "160k",
-         str(raw)])
-    rel = [{"word": w["word"].strip(), "start": round(float(w["start"]) - r0, 2),
-            "end": round(float(w["end"]) - r0, 2)}
-           for w in words if float(w["end"]) > r0 and float(w["start"]) < r1]
-    s0, s1 = clip["start"] - r0, clip["end"] - r0
+    hook = hook_span(words, clip) if opts["hook"] else None
+    if hook and not hook_raw(video, raw, r0, clip["start"], hook, r1):
+        hook = None
+    if not hook:
+        # extrait reencode (coupe exacte) : c'est lui que l'editeur montre et recadre
+        run(["ffmpeg", "-y", "-ss", str(r0), "-to", str(r1), "-i", str(video.resolve()),
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "160k",
+             str(raw)])
+    rel = shift_words(words, r0, clip["start"], hook, r1)
+    T = hook[1] - hook[0] if hook else 0.0
+    s0, s1 = clip["start"] - r0, clip["end"] - r0 + T
+    if hook:
+        print(f"    ouverture sur la reaction : {hook[0]:.1f}-{hook[1]:.1f} s repris en tete")
     samples = face_samples(raw, s0, s1) if use_face else []
     spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "",
                      clip.get("hashtags", ""))
@@ -1962,7 +2034,8 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     tags = clip.get("hashtags", "")
     (workdir / f"{name}.txt").write_text(
         f"{clip['title']}\n\n{clip.get('caption', '')}\n\n{tags}\n", encoding="utf-8")
-    return {**clip, "file": out.name, "raw": raw.name, "dur": round(r1 - r0, 2), "spec": spec,
+    return {**clip, "file": out.name, "raw": raw.name, "dur": round(r1 - r0 + T, 2), "spec": spec,
+            "hook": list(hook) if hook else None,
             "words": [[w["word"], w["start"], w["end"]] for w in rel]}
 
 
@@ -2200,7 +2273,25 @@ def selfcheck():
     assert [(a, b, r["crop"]["x"]) for a, b, r in plans(k)] == [(0, 4, .1), (4, 10, .6)]
     o = parse_opts('{"dmin": 61, "dmax": 200, "loop": false}')
     assert (o["dmin"], o["dmax"], o["loop"]) == (61, 90, False), o
-    assert (parse_opts('{"dmin": 80, "dmax": 82}')["dmin"], parse_opts("{}")["loop"]) == (40, True)
+    assert (parse_opts('{"dmin": 80, "dmax": 82}')["dmin"], parse_opts("{}")["loop"]) == (DMIN_DEF, True)
+    assert parse_opts("{}")["hook"] and not parse_opts('{"hook":false}')["hook"]
+    # ouverture sur la reaction : "oh my gosh" a 20 s d'un short qui commence a 0
+    hk = [{"word": w, "start": i * .5, "end": i * .5 + .4} for i, w in enumerate(("blah " * 40 + "Oh my GOSH! blah").split())]
+    sp_ = hook_span(hk, {"start": 0, "end": 30, "hook_text": "oh my gosh"})
+    assert sp_ and abs(sp_[0] - 19.85) < .01 and abs(sp_[1] - 21.75) < .01, sp_
+    assert hook_span(hk, {"start": 19, "end": 30, "hook_text": "oh my gosh"}) is None  # deja au debut
+    assert hook_span(hk, {"start": 0, "end": 30, "hook_text": "nothing like it"}) is None
+    sw_ = shift_words(hk, 0, 5, sp_, 30)
+    T_ = sp_[1] - sp_[0]
+    assert [w["word"] for w in sw_ if 5 <= w["start"] < 5 + T_] == ["Oh", "my", "GOSH!"], sw_
+    assert all(a["start"] <= b["start"] for a, b in zip(sw_, sw_[1:])), "mots en ordre"
+    # sous-titres mot par mot : un evenement par mot, le mot dit est colore
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        p = pathlib.Path(td) / "s.ass"
+        build_ass(hk[:3], [(0, 2)], p)
+        ev = [l for l in p.read_text(encoding="utf-8").splitlines() if l.startswith("Dialogue: 0")]
+        assert len(ev) == 3 and ",,BLAH {" in ev[1] and ev[1].count("fscx110") == 1, ev  # 2e mot allume
     # parole continue : un mot toutes les 0,5 s, "so" revient a 70 s
     talk = [{"word": "so" if i in (0, 140) else f"w{i}", "start": i * .5, "end": i * .5 + .4}
             for i in range(300)]
