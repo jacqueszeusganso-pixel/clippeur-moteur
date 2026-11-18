@@ -68,7 +68,8 @@ MAX_KEYS = 40
 DUR_MIN, DUR_MAX = 40, 90  # bornes du reglage "duree des shorts", en secondes
 DMIN_DEF = 65  # TikTok ne paie que les videos de plus d'une minute (video UNBORED, 2026-11-18)
 HOOK_MAX = 3.5  # ouverture sur la reaction : longueur max du passage repris en tete du short
-SPLIT_TOP = 0.4  # ecran partage : part de la hauteur donnee a la facecam
+SPLIT_TOP = 0.34  # ecran partage : part de la hauteur donnee a la facecam (le jeu prend le reste)
+SUB_SPLIT = 0.24  # ecran partage : sous-titres a 24 % du bas (au-dessus de l'interface TikTok/Reels)
 EDGE = 5.0  # marge gardee autour de chaque extrait brut, pour l'allonger a l'edition
 
 
@@ -355,9 +356,83 @@ def plan_layout(samples, opts, iw, ih):
     return "full"
 
 
-def facecam_crop(samples, iw, ih, ratio):
-    """Cadre autour de la facecam (visage median elargi), au ratio du panneau du haut."""
+def facecam_box(video, samples, s0, s1, n=24):
+    """Bords du cadre de la facecam incrustee autour du visage median. Ces bords restent fixes
+    pendant que le jeu bouge : la moyenne des contours sur n images les fait ressortir, la
+    mediane sur la largeur ecarte le texte du chat (hache). (x, y, w, h) normalises ou None."""
     faces = [smp for smp in samples if smp[1] is not None]
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    if not faces or s1 <= s0:
+        return None
+    cap = cv2.VideoCapture(str(video))
+    acc_x = acc_y = None
+    k = 0
+    for i in range(n):
+        cap.set(cv2.CAP_PROP_POS_MSEC, (s0 + (s1 - s0) * (i + .5) / n) * 1000)
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        g = cv2.cvtColor(cv2.resize(fr, (480, round(480 * fr.shape[0] / fr.shape[1]))),
+                         cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gx, gy = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0)), np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1))
+        acc_x, acc_y = (gx, gy) if acc_x is None else (acc_x + gx, acc_y + gy)
+        k += 1
+    cap.release()
+    if k < 4:
+        return None
+    H, W = acc_x.shape
+    cx = statistics.median(f[1] for f in faces) * W
+    cy = statistics.median(f[2] for f in faces) * H
+    fw = statistics.median(f[3] for f in faces) * W
+
+    def edge(prof, a, b, default):
+        a, b = int(max(0, min(a, b))), int(min(len(prof), max(a, b)))
+        if b - a < 2:
+            return default
+        i = int(prof[a:b].argmax())
+        return a + i if prof[a + i] > 4 * np.median(prof) else default
+    near, nv = 0.8 * fw, 0.6 * fw  # le cadre colle souvent au menton
+    col = np.median(acc_x[int(max(0, cy - fw)):int(min(H, cy + fw))], axis=0)
+    left, right = edge(col, 3, cx - near, 0), edge(col, cx + near, W - 3, W)
+    row = np.median(acc_y[:, int(left) + 2:max(int(left) + 3, int(right) - 2)], axis=1)
+    top, bot = edge(row, 3, cy - nv, 0), edge(row, cy + nv, H - 3, H)
+    if (right - left) < 2 * fw or (bot - top) < 1.5 * fw or (right - left) * (bot - top) > .5 * W * H:
+        return None  # pas un cadre de facecam plausible
+    return left / W, top / H, (right - left) / W, (bot - top) / H
+
+
+def game_crop(iw, ih, ratio, box=None):
+    """Cadre du jeu (panneau du bas), centre, decale pour ne pas mordre sur la facecam."""
+    cw, ch, x, y = compute_crop(iw, ih, 0.5, 0.5, ratio)
+    if box and box[3] > .2:
+        bl, br = box[0] * iw, (box[0] + box[2]) * iw
+        if x + cw > bl and x < br:  # chevauche le cadre de la camera
+            if bl - cw >= 0 and (bl + br) / 2 > iw / 2:
+                x = int(bl - cw) // 2 * 2
+            elif br + cw <= iw:
+                x = int(br + 1) // 2 * 2
+    return cw, ch, x, y
+
+
+def facecam_crop(samples, iw, ih, ratio, box=None):
+    """Cadre autour de la facecam, au ratio du panneau du haut. Avec `box` (cadre detecte),
+    le plus grand cadre tenant dedans, centre sur le visage : rien du jeu ne deborde."""
+    faces = [smp for smp in samples if smp[1] is not None]
+    if box and faces:
+        # rentre de 1,5 % : la mesure des bords se fait au pixel pres sur une image reduite
+        m = .015 * ih
+        bx, by, bw_, bh_ = box[0] * iw + m, box[1] * ih + 2.5 * m, box[2] * iw - 2 * m, box[3] * ih - 3.5 * m  # le chat deborde souvent sur le haut
+        cx = statistics.median(f[1] for f in faces) * iw
+        cy = statistics.median(f[2] for f in faces) * ih
+        w, h = (bh_ * ratio, bh_) if bw_ / bh_ > ratio else (bw_, bw_ / ratio)
+        w, h = int(w) // 2 * 2, int(h) // 2 * 2
+        x = int(min(max(cx - w / 2, bx), bx + bw_ - w)) + 1
+        y = int(min(max(cy - h / 2, by), by + bh_ - h)) + 1
+        return w, h, min(x, iw - w), min(y, ih - h)
     cx = statistics.median(f[1] for f in faces) * iw
     cy = statistics.median(f[2] for f in faces) * ih
     fwp = statistics.median(f[3] for f in faces) * iw
@@ -721,11 +796,14 @@ def ink_on(hexc):
 
 
 def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None,
-              subs=True, color=ACCENT, subc="#FFFFFF", font="Arial Black", accent=None, cta=""):
+              subs=True, color=ACCENT, subc="#FFFFFF", font="Arial Black", accent=None, cta="", top=0):
     """Sous-titres ASS : groupes de mots gros et centres, titre en haut si demande.
     `segs` = morceaux gardes de la source ; les temps sont recales dessus.
     `accent` : le mot le plus long de chaque groupe prend cette couleur (l'oeil s'y accroche)."""
     W, H, fs = FORMATS[fmt]
+    # top = hauteur du panneau facecam (ecran partage) : titre et appel passent juste dessous
+    t_mv = top + 24 if top else round(H * .07)
+    c_mv = (t_mv + round(fs * .62 * 1.3) + 40 if title else t_mv) if top else round(H * .125)
     big = font == "Anton"  # police etroite : plus grande a lisibilite egale
     header = (
         f"[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\n\n"
@@ -736,11 +814,11 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
         f"{0 if big else -1},1,{7 if big else 6},2,2,80,80,{round(H * .135) if margin_v is None else margin_v}\n"
         # titre : texte sur bandeau de couleur (BorderStyle 3 = boite opaque)
         f"Style: Title,Arial Black,{round(fs * .62)},{ass_color(ink_on(color))},{ass_color(color)},&H00000000,"
-        f"-1,3,14,0,8,90,90,{round(H * .07)}\n"
+        f"-1,3,14,0,8,90,90,{t_mv}\n"
         # appel a l'action des campagnes : petit bandeau sombre sous le titre (le bas de l'ecran
         # est mange par l'interface de TikTok et Reels)
         f"Style: Cta,Arial Black,{round(fs * .4)},&H00FFFFFF,&H50000000,&H00000000,"
-        f"-1,3,10,0,8,60,60,{round(H * .125)}\n\n"
+        f"-1,3,10,0,8,60,60,{c_mv}\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     lo, hi = segs[0][0], segs[-1][1]
@@ -894,9 +972,9 @@ def plans(spec):
             for i, (a, r) in enumerate(out)]
 
 
-def auto_spec(samples, opts, iw, ih, s0, s1, title, tags=""):
+def auto_spec(samples, opts, iw, ih, s0, s1, title, tags="", box=None):
     """Reglages de depart, habillage compris (theme choisi a la generation)."""
-    sp = base_spec(samples, opts, iw, ih, s0, s1, title)
+    sp = base_spec(samples, opts, iw, ih, s0, s1, title, box)
     sp.update(theme=opts.get("theme", "none"), bleed=opts.get("bleed", True), kicker=gta_kicker(), lab1="", lab2="",
               credit="", ticker=" ".join(tags.split()[:8]) or title)
     if sp["theme"] == "versus" and iw > ih:
@@ -918,25 +996,25 @@ def auto_spec(samples, opts, iw, ih, s0, s1, title, tags=""):
                 sp["cam"] = norm_rect(cam, iw, ih)
                 sp["game"] = norm_rect(compute_crop(iw, ih, cx, cy, r1), iw, ih)
             else:  # vraie facecam dans un coin : on la garde, le jeu prend le reste
-                sp["cam"] = norm_rect(facecam_crop(samples, iw, ih, r0), iw, ih) if faces else sp["cam"]
-                sp["game"] = norm_rect(compute_crop(iw, ih, .5, .5, r1), iw, ih)
+                sp["cam"] = norm_rect(facecam_crop(samples, iw, ih, r0, box), iw, ih) if faces else sp["cam"]
+                sp["game"] = norm_rect(game_crop(iw, ih, r1, box), iw, ih)
     return sp
 
 
-def base_spec(samples, opts, iw, ih, s0, s1, title):
+def base_spec(samples, opts, iw, ih, s0, s1, title, box=None):
     """Reglages de depart d'un short : ce que le moteur choisit seul, modifiable ensuite."""
     W, H, _ = FORMATS[opts["format"]]
     ht, hb = split_heights(H)
     faces = [smp for smp in samples if smp[1] is not None]
     cx = statistics.median(f[1] for f in faces) if faces else 0.5
     cy = statistics.median(f[2] for f in faces) if faces else 0.5
-    cam = facecam_crop(samples, iw, ih, W / ht) if faces else \
+    cam = facecam_crop(samples, iw, ih, W / ht, box) if faces else \
         compute_crop(iw, ih, 0.12, 0.15, W / ht)
     return {
         "format": opts["format"], "layout": plan_layout(samples, opts, iw, ih),
         "crop": norm_rect(compute_crop(iw, ih, cx, cy, W / H), iw, ih),
         "cam": norm_rect(cam, iw, ih),
-        "game": norm_rect(compute_crop(iw, ih, 0.5, 0.5, W / hb), iw, ih),
+        "game": norm_rect(game_crop(iw, ih, W / hb, box), iw, ih),
         "track": bool(faces), "trim": [round(s0, 2), round(s1, 2)],
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
         "color": ACCENT, "subc": "#FFFFFF", "keys": [], "voice": opts.get("voice", False),
@@ -1650,7 +1728,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
     if len(cuts) > 1:  # cadrages valides moment par moment : un plan chacun, mis bout a bout
         ht, hb = split_heights(H)
         build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], cta=spec.get("cta", ""), **look,
-                  margin_v=hb - round(fs * .5) if split else None)
+                  margin_v=round(H * SUB_SPLIT) if split else None, top=ht if split else 0)
 
         def box(r, ratio):
             return rect_px(r, iw, ih, ratio) if r else compute_crop(iw, ih, 0.5, 0.5, ratio)
@@ -1673,9 +1751,9 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
         print(f"    {len(cuts)} cadrages choisis a la main")
     elif split:
         ht, hb = split_heights(H)
-        # sous-titres a cheval sur la jonction des deux panneaux
-        build_ass(sw, segs, subs, spec["format"], spec["title"],
-                  margin_v=hb - round(fs * .5), subs=spec["subs"], cta=spec.get("cta", ""), **look)
+        # sous-titres dans le jeu, sous le visage : jamais sur la tete du streamer
+        build_ass(sw, segs, subs, spec["format"], spec["title"], top=ht,
+                  margin_v=round(H * SUB_SPLIT), subs=spec["subs"], cta=spec.get("cta", ""), **look)
         fw_, fh_, fx, fy = rect_px(spec["cam"], iw, ih, W / ht)
         gw, gh, gx, gy = rect_px(spec["game"], iw, ih, W / hb)
         graph = (f"[0:v]{pre}split=2[a][b];"
@@ -2067,8 +2145,11 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     if hook:
         print(f"    ouverture sur la reaction : {hook[0]:.1f}-{hook[1]:.1f} s repris en tete")
     samples = face_samples(raw, s0, s1) if use_face else []
+    box = facecam_box(raw, samples, s0, s1) if samples else None
+    if box:
+        print(f"    cadre de la facecam : x {box[0]:.2f} y {box[1]:.2f} l {box[2]:.2f} h {box[3]:.2f}")
     spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "",
-                     clip.get("hashtags", ""))
+                     clip.get("hashtags", ""), box)
     if opts["layout"] == "auto" and spec["layout"] == "full" and spec["theme"] != "versus":
         # pas de facecam de streamer : le realisateur choisit plein cadre ou partage plan par plan
         spec = apply_director(spec, director(raw, s0, s1, iw, ih, spec))
@@ -2399,6 +2480,16 @@ def selfcheck():
     pc = pathlib.Path(tempfile.mkdtemp()) / "c.ass"
     build_ass([], [(0, 2)], pc, cta="WATCH")
     assert ",Cta,,0,0,0,,WATCH" in pc.read_text(encoding="utf-8")
+    # cadre de facecam detecte : le cadrage du haut reste dedans, le jeu l'evite
+    fb = (0.698, 0.426, 0.302, 0.315)
+    camf = [(i * .5, .85, .62, .07) for i in range(10)]
+    w_, h_, x_, y_ = facecam_crop(camf, 1920, 1080, 1080 / 652, fb)
+    assert x_ >= 0.698 * 1920 and x_ + w_ <= 1920 and y_ >= .426 * 1080 and y_ + h_ <= .741 * 1080 + 1, (w_, h_, x_, y_)
+    gw_, _, gx_, _ = game_crop(1920, 1080, 1080 / 1268, fb)
+    assert gx_ + gw_ <= 0.698 * 1920 + 1, (gw_, gx_)
+    pt = pathlib.Path(tempfile.mkdtemp()) / "t.ass"
+    build_ass([], [(0, 2)], pt, title="T", cta="C", top=652)
+    assert ",8,90,90,676" in pt.read_text(encoding="utf-8")  # titre juste sous la facecam
     print("selfcheck OK")
     return 0
 
