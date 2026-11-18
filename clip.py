@@ -34,6 +34,8 @@ USER_AGENT = "Mozilla/5.0 (clippeur-maison)"
 # format -> (largeur, hauteur, taille des sous-titres)
 FORMATS = {"9:16": (1080, 1920, 96), "4:5": (1080, 1350, 84),
            "1:1": (1080, 1080, 76), "16:9": (1920, 1080, 72)}
+from gta_taxonomy import CATEGORY_LABELS, classify_text  # plugin GTA (MIT), meme dossier
+
 # type de video -> consigne ajoutee au choix des moments
 CATS = {
     "auto": "",
@@ -43,8 +45,20 @@ CATS = {
            "les situations imprevues et les grosses reactions.",
     "gaming": "C'est un live de jeu video : privilegie la rage, les victoires, les moments "
               "droles et les reactions du streamer (tu ne vois que ce qui est dit).",
+    "gta": "C'est une video de GTA (V ou VI) : les grands moments sont les poursuites avec la "
+           "police, les crashs et carambolages, les cascades reussies ou ratees, les fusillades, le "
+           "chaos des PNJ, les missions et braquages reussis ou rates, les morts absurdes (wasted, "
+           "busted) et les bugs, toujours avec la reaction du joueur. Garde environ 8 s de mise en "
+           "place avant l'evenement et 10 s de reaction apres ; hook_text = l'evenement ou le cri. "
+           "Un recit au passe, un plan pour plus tard ou une hypothese ne sont pas des moments.",
     "podcast": "C'est un podcast ou une interview : privilegie les idees fortes, les "
                "anecdotes et les avis tranches qui se comprennent seuls.",
+}
+# mode campagne (Content Rewards) : texte d'appel incruste + credit dans la legende, sans voix off
+CAMPAIGNS = {
+    "tomo": {"cta": "SUBSCRIBE TO TOMO ON YOUTUBE @Tomovids", "tags": "#tomovids #gta6 @Tomovids"},
+    "ruckus": {"cta": "WATCH DASGASDOM ON KICK: kick.com/dasgasd3m",
+               "tags": "#dasgasdom3 #gta6 kick.com/dasgasd3m"},
 }
 MAX_RANGE = 3600  # une heure max par passage (quota audio Groq gratuit)
 LAYOUTS = ("auto", "full", "split")
@@ -144,7 +158,10 @@ def parse_opts(raw):
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
         "bleed": d.get("bleed", True) is not False,
         "voice": d.get("voice") is True,
+        "camp": d.get("camp") if d.get("camp") in CAMPAIGNS else "",
     }
+    if o["camp"]:
+        o["voice"] = False  # les campagnes refusent une voix fabriquee
     try:
         a, b = int(float(d["dmin"])), int(float(d["dmax"]))
         a, b = max(DUR_MIN, min(a, DUR_MAX)), max(DUR_MIN, min(b, DUR_MAX))
@@ -567,6 +584,16 @@ def select_clips(words, key, n, cat="auto", find="", opts=None):
     return best_distinct([fit_clip(c, words, opts) for c in found], n)
 
 
+def gta_hints(transcript, limit=30):
+    """Lignes de la transcription ou le plugin GTA repere un evenement (poursuite, crash...)."""
+    found = []
+    for m in re.finditer(r"^\[[\d:]+\] \((\d+)s\) (.*)$", transcript, re.M):
+        for cue in classify_text(m.group(2)):
+            found.append((cue.strength, int(m.group(1)), CATEGORY_LABELS[cue.category], cue.phrase))
+    best = sorted(found, reverse=True)[:limit]
+    return "\n".join(f'- {t}s {lab} : "{ph}"' for _, t, lab, ph in sorted(best, key=lambda x: x[1]))
+
+
 def select_in(transcript, total, key, n, cat, find, partial, opts):
     sys_msg = ("Tu es un monteur expert en shorts viraux (TikTok, Reels, YouTube Shorts). "
                "A partir d'une transcription horodatee, tu reperes les meilleurs extraits "
@@ -600,6 +627,10 @@ def select_in(transcript, total, key, n, cat, find, partial, opts):
                      "de l'extrait revient juste apres dans la video, arrete-toi juste avant.")
     if CATS.get(cat):
         user_msg += "\n\nContexte : " + CATS[cat]
+    hints = gta_hints(transcript) if cat in ("gta", "gaming") else ""
+    if hints:
+        user_msg += ("\n\nEvenements GTA reperes dans ce qui est dit (indices, a confirmer avec la "
+                     "transcription) :\n" + hints)
     if find:
         user_msg += ("\n\nLe spectateur cherche un moment precis : \u00ab " + find + " \u00bb. "
                      "Ne retiens que des extraits qui y correspondent, du plus probable au "
@@ -690,7 +721,7 @@ def ink_on(hexc):
 
 
 def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=None,
-              subs=True, color=ACCENT, subc="#FFFFFF", font="Arial Black", accent=None):
+              subs=True, color=ACCENT, subc="#FFFFFF", font="Arial Black", accent=None, cta=""):
     """Sous-titres ASS : groupes de mots gros et centres, titre en haut si demande.
     `segs` = morceaux gardes de la source ; les temps sont recales dessus.
     `accent` : le mot le plus long de chaque groupe prend cette couleur (l'oeil s'y accroche)."""
@@ -705,7 +736,11 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
         f"{0 if big else -1},1,{7 if big else 6},2,2,80,80,{round(H * .135) if margin_v is None else margin_v}\n"
         # titre : texte sur bandeau de couleur (BorderStyle 3 = boite opaque)
         f"Style: Title,Arial Black,{round(fs * .62)},{ass_color(ink_on(color))},{ass_color(color)},&H00000000,"
-        f"-1,3,14,0,8,90,90,{round(H * .07)}\n\n"
+        f"-1,3,14,0,8,90,90,{round(H * .07)}\n"
+        # appel a l'action des campagnes : petit bandeau sombre sous le titre (le bas de l'ecran
+        # est mange par l'interface de TikTok et Reels)
+        f"Style: Cta,Arial Black,{round(fs * .4)},&H00FFFFFF,&H50000000,&H00000000,"
+        f"-1,3,10,0,8,60,60,{round(H * .125)}\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     lo, hi = segs[0][0], segs[-1][1]
@@ -714,6 +749,8 @@ def build_ass(words, segs, out_path, fmt="9:16", title="", group=3, margin_v=Non
     events = []
     if title:
         events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(total)},Title,,0,0,0,,{ass_text(title)}")
+    if cta:
+        events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(total)},Cta,,0,0,0,,{ass_text(cta)}")
     # mot par mot : le groupe reste affiche, le mot prononce s'allume a l'instant ou il est dit
     hl = accent or "#FFD60A"
     if hl.upper() == subc.upper():
@@ -818,6 +855,7 @@ def parse_spec(d, dur):
         "theme": d.get("theme") if d.get("theme") in THEMES else "none",
         "bleed": d.get("bleed", True) is not False,
         "voice": d.get("voice") is True,
+        "cta": ass_text(str(d.get("cta") or ""))[:80],
         **{k: ass_text(str(d.get(k) or ""))[:n] for k, n in TEXTS.items()},
     }
 
@@ -902,6 +940,7 @@ def base_spec(samples, opts, iw, ih, s0, s1, title):
         "track": bool(faces), "trim": [round(s0, 2), round(s1, 2)],
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
         "color": ACCENT, "subc": "#FFFFFF", "keys": [], "voice": opts.get("voice", False),
+        "cta": CAMPAIGNS[opts["camp"]]["cta"] if opts.get("camp") else "",
     }
 
 
@@ -1585,7 +1624,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
     if wins:  # habillage GTA : son propre graphe, le reste de la fonction ne change pas
         th = THEMES[spec["theme"]]
         sub_y = th["sub"][theme_mode(spec)]
-        build_ass(sw, segs, subs, "9:16", "", subs=spec["subs"], subc=spec.get("subc", "#FFFFFF"),
+        build_ass(sw, segs, subs, "9:16", "", subs=spec["subs"], cta=spec.get("cta", ""), subc=spec.get("subc", "#FFFFFF"),
                   margin_v=round(H - sub_y - fs * .55), font="Anton", accent=th["accent"])
         fonts = out.parent / "fonts"
         fonts.mkdir(exist_ok=True)
@@ -1610,7 +1649,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
     cuts = plans(spec)
     if len(cuts) > 1:  # cadrages valides moment par moment : un plan chacun, mis bout a bout
         ht, hb = split_heights(H)
-        build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look,
+        build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], cta=spec.get("cta", ""), **look,
                   margin_v=hb - round(fs * .5) if split else None)
 
         def box(r, ratio):
@@ -1636,7 +1675,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
         ht, hb = split_heights(H)
         # sous-titres a cheval sur la jonction des deux panneaux
         build_ass(sw, segs, subs, spec["format"], spec["title"],
-                  margin_v=hb - round(fs * .5), subs=spec["subs"], **look)
+                  margin_v=hb - round(fs * .5), subs=spec["subs"], cta=spec.get("cta", ""), **look)
         fw_, fh_, fx, fy = rect_px(spec["cam"], iw, ih, W / ht)
         gw, gh, gx, gy = rect_px(spec["game"], iw, ih, W / hb)
         graph = (f"[0:v]{pre}split=2[a][b];"
@@ -1645,7 +1684,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
                  f"[top][bot]vstack,subtitles={subs.name}[v]")
         vargs = ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
     else:
-        build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], **look)
+        build_ass(sw, segs, subs, spec["format"], spec["title"], subs=spec["subs"], cta=spec.get("cta", ""), **look)
         if spec["track"] and samples:
             cw, ch, _, _ = compute_crop(iw, ih, 0.5, 0.5, W / H)
             x, y = track_crop(samples, segs, iw, ih, cw, ch)
@@ -2006,6 +2045,10 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
                 total=None, key=None):
     """Extrait brut (moment + marge) puis short. Renvoie l'entree de shorts.json."""
     opts = opts or parse_opts("{}")
+    if opts.get("camp"):
+        need = CAMPAIGNS[opts["camp"]]["tags"].split()
+        have = [t for t in clip.get("hashtags", "").split() if t.lower() not in {n.lower() for n in need}]
+        clip = {**clip, "hashtags": " ".join(need + have)}
     name = f"short_{index:02d}_{clip['score']:03d}_{slugify(clip['title'])}"
     total = total or ffprobe_duration(video)
     r0, r1 = max(0.0, clip["start"] - EDGE), min(total, clip["end"] + EDGE)
@@ -2345,6 +2388,17 @@ def selfcheck():
             assert two and two[0][1] == "split", two
     except ImportError:
         print("[info] OpenCV absent : realisateur non teste")
+    # plugin GTA + mode campagne
+    h = gta_hints("[00:05] (5s) oh the cops are chasing me\n[00:09] (9s) if I crashed it would be bad")
+    assert "5s Chase" in h and "9s" not in h, h  # l'hypothese est ecartee
+    o = parse_opts('{"camp":"tomo","voice":true,"cat":"gta"}')
+    assert o["camp"] == "tomo" and o["voice"] is False and o["cat"] == "gta"
+    assert parse_opts('{"camp":"x"}')["camp"] == ""
+    assert base_spec([], o, 1920, 1080, 0, 9, "T")["cta"].startswith("SUBSCRIBE")
+    assert parse_spec({"cta": "HI"}, 9)["cta"] == "HI" and parse_spec({}, 9)["cta"] == ""
+    pc = pathlib.Path(tempfile.mkdtemp()) / "c.ass"
+    build_ass([], [(0, 2)], pc, cta="WATCH")
+    assert ",Cta,,0,0,0,,WATCH" in pc.read_text(encoding="utf-8")
     print("selfcheck OK")
     return 0
 
