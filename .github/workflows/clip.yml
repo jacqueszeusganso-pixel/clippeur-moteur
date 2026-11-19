@@ -30,7 +30,7 @@ jobs:
     steps:
       - name: Verifier les entrees
         run: |
-          [[ "$N" =~ ^[1-6]$ ]] || { echo "clips invalide"; exit 1; }
+          [[ "$N" =~ ^([1-9]|10)$ ]] || { echo "clips invalide"; exit 1; }
           [[ "$JOB" =~ ^[a-f0-9]{16}$ ]] || { echo "job_id invalide"; exit 1; }
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
