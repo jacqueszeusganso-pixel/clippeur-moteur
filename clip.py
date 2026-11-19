@@ -50,13 +50,18 @@ CATS = {
            "chaos des PNJ, les missions et braquages reussis ou rates, les morts absurdes (wasted, "
            "busted) et les bugs, toujours avec la reaction du joueur. Garde environ 8 s de mise en "
            "place avant l'evenement et 10 s de reaction apres ; hook_text = l'evenement ou le cri. "
-           "Un recit au passe, un plan pour plus tard ou une hypothese ne sont pas des moments.",
+           "Un recit au passe, un plan pour plus tard ou une hypothese ne sont pas des moments. "
+           "Ecarte les cinematiques (dialogues entre personnages du jeu), la lecture du chat, les "
+           "menus et les temps calmes. Le titre dit l'action GTA concrete (qui, quoi : 'Police "
+           "chase ends in a 5-car pileup'), jamais un mot vague comme 'Shock' ou 'Moment'.",
     "podcast": "C'est un podcast ou une interview : privilegie les idees fortes, les "
                "anecdotes et les avis tranches qui se comprennent seuls.",
 }
 # mode campagne (Content Rewards) : texte d'appel incruste + credit dans la legende, sans voix off
 CAMPAIGNS = {
-    "tomo": {"cta": "SUBSCRIBE TO TOMO ON YOUTUBE @Tomovids", "tags": "#tomovids #gta6 @Tomovids"},
+    # box = cadre fixe de la facecam (x, y, l, h normalises), mesure sur le live du 2026-11-18
+    "tomo": {"cta": "SUBSCRIBE TO TOMO ON YOUTUBE @Tomovids", "tags": "#tomovids #gta6 @Tomovids",
+             "box": (0.698, 0.426, 0.302, 0.315)},
     "ruckus": {"cta": "WATCH DASGASDOM ON KICK: kick.com/dasgasd3m",
                "tags": "#dasgasdom3 #gta6 kick.com/dasgasd3m"},
 }
@@ -334,13 +339,17 @@ def piecewise_expr(points):
     return expr
 
 
-def plan_layout(samples, opts, iw, ih):
+def plan_layout(samples, opts, iw, ih, box=None):
     """'split' (facecam en haut, jeu en bas) ou 'full' (plein cadre qui suit le visage)."""
     faces = [smp for smp in samples if smp[1] is not None]
     vertical = opts["format"] in ("9:16", "4:5") and iw > ih
     if not faces or not vertical or opts["layout"] == "full":
         return "full"
     if opts["layout"] == "split":
+        return "split"
+    # cadre de facecam detecte (ou streamer de campagne) : toujours visage en haut, jeu en bas.
+    # Les visages des cinematiques du jeu faussaient le test "visage fixe" (shorts au visage centre).
+    if box or opts.get("camp"):
         return "split"
     cx = statistics.median(f[1] for f in faces)
     cy = statistics.median(f[2] for f in faces)
@@ -354,6 +363,10 @@ def plan_layout(samples, opts, iw, ih):
             and (abs(cx - 0.5) > 0.2 or abs(cy - 0.5) > 0.2)):
         return "split"
     return "full"
+
+
+def in_box(smp, box):
+    return box[0] <= smp[1] <= box[0] + box[2] and box[1] <= smp[2] <= box[1] + box[3]
 
 
 def facecam_box(video, samples, s0, s1, n=24):
@@ -1021,7 +1034,7 @@ def base_spec(samples, opts, iw, ih, s0, s1, title, box=None):
     cam = facecam_crop(samples, iw, ih, W / ht, box) if faces else \
         compute_crop(iw, ih, 0.12, 0.15, W / ht)
     return {
-        "format": opts["format"], "layout": plan_layout(samples, opts, iw, ih),
+        "format": opts["format"], "layout": plan_layout(samples, opts, iw, ih, box),
         "crop": norm_rect(compute_crop(iw, ih, cx, cy, W / H), iw, ih),
         "cam": norm_rect(cam, iw, ih),
         "game": norm_rect(game_crop(iw, ih, W / hb, box), iw, ih),
@@ -2207,7 +2220,12 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     if hook:
         print(f"    ouverture sur la reaction : {hook[0]:.1f}-{hook[1]:.1f} s repris en tete")
     samples = face_samples(raw, s0, s1) if use_face else []
-    box = facecam_box(raw, samples, s0, s1) if samples else None
+    box = CAMPAIGNS.get(opts.get("camp") or "", {}).get("box")
+    if box:  # streamer connu : seuls les visages dans sa facecam comptent (pas ceux des cinematiques)
+        samples = [smp if smp[1] is not None and in_box(smp, box) else (smp[0], None, None, None)
+                   for smp in samples]
+    elif samples:
+        box = facecam_box(raw, samples, s0, s1)
     if box:
         print(f"    cadre de la facecam : x {box[0]:.2f} y {box[1]:.2f} l {box[2]:.2f} h {box[3]:.2f}")
     spec = auto_spec(samples, opts, iw, ih, s0, s1, clip["title"] if opts["title"] else "",
@@ -2560,6 +2578,9 @@ def selfcheck():
                      "-af", "aselect='x'", "o.mp4"], ["-af", "aselect='x'"])
     assert "-af" not in fc and fc[2].endswith(";[0:a]aselect='x'[aout]") and "[aout]" in fc, fc
     assert fold_audio(["ffmpeg", "-vf", "null", "-af", "a"], ["-af", "a"]) == ["ffmpeg", "-vf", "null", "-af", "a"]
+    moving = [(i * .5, .2 + (i % 3) * .3, .4, .1) for i in range(10)]  # visages du jeu qui bougent
+    assert plan_layout(moving, parse_opts("{}"), 1920, 1080, (.7, .4, .3, .3)) == "split"
+    assert in_box((0, .85, .6, .05), CAMPAIGNS["tomo"]["box"]) and not in_box((0, .3, .4, .1), CAMPAIGNS["tomo"]["box"])
     print("selfcheck OK")
     return 0
 
