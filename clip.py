@@ -165,6 +165,7 @@ def parse_opts(raw):
         "bleed": d.get("bleed", True) is not False,
         "voice": d.get("voice") is True,
         "camp": d.get("camp") if d.get("camp") in CAMPAIGNS else "",
+        "badge": parse_badge(d.get("badge")), "logo": parse_logo(d.get("logo")),
     }
     if o["camp"]:
         o["voice"] = False  # les campagnes refusent une voix fabriquee
@@ -957,6 +958,7 @@ def parse_spec(d, dur):
         "bleed": d.get("bleed", True) is not False,
         "voice": d.get("voice") is True,
         "cta": ass_text(str(d.get("cta") or ""))[:80],
+        "badge": parse_badge(d.get("badge")), "logo": parse_logo(d.get("logo")),
         **{k: ass_text(str(d.get(k) or ""))[:n] for k, n in TEXTS.items()},
     }
 
@@ -1042,6 +1044,7 @@ def base_spec(samples, opts, iw, ih, s0, s1, title, box=None):
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
         "color": ACCENT, "subc": "#FFFFFF", "keys": [], "voice": opts.get("voice", False),
         "cta": CAMPAIGNS[opts["camp"]]["cta"] if opts.get("camp") else "",
+        "badge": opts.get("badge"), "logo": opts.get("logo"),
     }
 
 
@@ -1628,6 +1631,187 @@ def theme_assets(outdir):
     return 0
 
 
+# ----------------------------------------------------------------------------- incrustations
+# Demande de Jacques (2026-11-19), en plus de tout le reste : un texte "theme de la video" au
+# style GTA (police, couleurs au choix) et un logo (celui de la chaine, ou un autre), chacun pose
+# ou on veut et deplacable dans l'editeur. Dessines par Pillow, colles par-dessus l'image finale :
+# ca marche pareil pour tous les formats, habillages et mises en page.
+# x, y = centre de l'element en fraction de l'image finale ; size = echelle (texte) ou largeur (logo).
+BADGE_STYLES = ("vice", "france", "wanted", "street", "neon")
+LOGO_RE = re.compile(r"^data:image/(png|webp|jpeg);base64,[A-Za-z0-9+/]+={0,2}$")
+LOGO_MAX = 24000  # caracteres : le logo voyage dans les reglages (entrees du workflow, ligne de commande)
+FR_BLUE, FR_RED = "#0055A4", "#EF4135"
+
+
+def _frac(v, lo, hi, default):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return round(min(max(v, lo), hi), 4) if math.isfinite(v) else default
+
+
+def parse_badge(d):
+    """Texte theme : {"text", "style", "x", "y", "size"}, ou None si pas de texte."""
+    if not isinstance(d, dict):
+        return None
+    text = re.sub(r"\s+", " ", str(d.get("text") or "")).strip()[:40]
+    if not text:
+        return None
+    return {"text": text, "style": d.get("style") if d.get("style") in BADGE_STYLES else "vice",
+            "x": _frac(d.get("x"), 0, 1, .5), "y": _frac(d.get("y"), 0, 1, .2),
+            "size": _frac(d.get("size"), .5, 2, 1)}
+
+
+def logo_image(data):
+    """Image Pillow du logo (data URL), ou None si illisible."""
+    import base64
+    import io
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(base64.b64decode(data.split(",", 1)[1], validate=True)))
+        if im.width * im.height > 1024 * 1024:
+            return None
+        return im.convert("RGBA")
+    except Exception:
+        return None
+
+
+def parse_logo(d):
+    """Logo : {"img" (data URL png/webp/jpeg), "x", "y", "size" (largeur / largeur de l'image)}."""
+    if not isinstance(d, dict):
+        return None
+    img = str(d.get("img") or "")
+    if len(img) > LOGO_MAX or not LOGO_RE.match(img) or logo_image(img) is None:
+        return None
+    return {"img": img, "x": _frac(d.get("x"), 0, 1, .86), "y": _frac(d.get("y"), 0, 1, .07),
+            "size": _frac(d.get("size"), .05, .6, .18)}
+
+
+def badge_image(b, W):
+    """Le texte theme en RGBA transparent, a l'echelle d'une image de largeur W."""
+    from PIL import Image, ImageDraw, ImageFilter
+    fs = max(16, round(W * .075 * b["size"]))
+    text, st = b["text"].upper(), b["style"]
+    font = _font("Anton-Regular.ttf", fs)
+    sw = max(2, round(fs * (.09 if st in ("street", "france", "vice") else .06)))
+    l, t, r, bt = font.getbbox(text, stroke_width=sw)
+    tw, th = r - l, bt - t
+    pad = round(fs * (.42 if st == "wanted" else .3))
+    w, h = tw + pad * 2, th + pad * 2 + (round(fs * .2) if st == "france" else 0)
+    org = (pad - l, pad - t)
+    clear = (0, 0, 0, 0)
+
+    def mask(stroke=0):
+        m = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(m).text(org, text, font=font, fill=255, stroke_width=stroke, stroke_fill=255)
+        return m
+
+    def solid(c):
+        return Image.new("RGBA", (w, h), c)
+    core, edge = mask(), mask(sw)
+    out = solid(clear)
+    if st == "wanted":  # plaque noire, liseré or, texte or
+        d = ImageDraw.Draw(out)
+        d.rectangle((0, 0, w - 1, h - 1), fill=(10, 10, 12, 225), outline=_rgb(GOLD), width=max(3, fs // 14))
+        out.paste(solid(_rgb(GOLD)), (0, 0), core)
+        return out
+    shadow = edge.filter(ImageFilter.GaussianBlur(fs * .08)).point(lambda v: int(v * .7))
+    out.paste(solid((0, 0, 0, 255)), (round(fs * .04), round(fs * .07)), shadow)
+    if st == "neon":  # halo cyan, coeur blanc
+        glow = edge.filter(ImageFilter.GaussianBlur(fs * .12))
+        for _ in range(2):
+            out.alpha_composite(Image.composite(solid(_rgb(CYAN)), solid(clear), glow))
+        out.paste(solid((255, 255, 255, 255)), (0, 0), core)
+        return out
+    out.paste(solid((12, 8, 16, 255)), (0, 0), edge)  # contour sombre
+    fill = solid((255, 255, 255, 255))
+    x0, x1 = org[0] + l, org[0] + r
+    if st == "vice":  # degrade rose -> orange de haut en bas
+        g = Image.linear_gradient("L").resize((w, h))
+        fill = Image.composite(solid(_rgb(ORANGE)), solid(_rgb(PINK)), g)
+    elif st == "france":  # bleu, blanc, rouge en trois bandes
+        d = ImageDraw.Draw(fill)
+        for i, col in enumerate((FR_BLUE, "#FFFFFF", FR_RED)):
+            d.rectangle((x0 + (x1 - x0) * i / 3, 0, x0 + (x1 - x0) * (i + 1) / 3, h), fill=_rgb(col))
+        d.rectangle((0, 0, x0, h), fill=_rgb(FR_BLUE))
+        d.rectangle((x1, 0, w, h), fill=_rgb(FR_RED))
+    out.paste(fill, (0, 0), core)
+    if st == "france":  # filet tricolore sous le texte
+        d = ImageDraw.Draw(out)
+        y0, bh = pad + th + round(fs * .04), max(4, round(fs * .1))
+        for i, col in enumerate((FR_BLUE, "#FFFFFF", FR_RED)):
+            d.rectangle((pad + (w - 2 * pad) * i / 3, y0, pad + (w - 2 * pad) * (i + 1) / 3, y0 + bh),
+                        fill=_rgb(col))
+    if st in ("vice", "france"):  # penche vers l'avant, comme les titres de la serie
+        k = .16
+        out = out.transform((w + round(k * h), h), Image.Transform.AFFINE, (1, k, -k * h, 0, 1, 0),
+                            Image.Resampling.BICUBIC)
+    return out
+
+
+def stamp_layers(spec, W, H, workdir):
+    """PNG du logo et du texte theme, avec leur coin haut-gauche dans l'image finale."""
+    from PIL import Image
+    out = []
+
+    def place(im, x, y, tag):
+        px = round(min(max(x * W - im.width / 2, 0), max(0, W - im.width)))
+        py = round(min(max(y * H - im.height / 2, 0), max(0, H - im.height)))
+        f = pathlib.Path(workdir) / f"_stamp_{tag}_{os.getpid()}.png"
+        im.save(f)
+        out.append((f, px, py))
+    lg = spec.get("logo")
+    if lg:
+        im = logo_image(lg["img"])
+        if im:
+            lw = max(8, round(W * lg["size"]))
+            lh = max(8, round(im.height * lw / im.width))
+            if lh > H * .5:
+                lh, lw = round(H * .5), max(8, round(im.width * H * .5 / im.height))
+            place(im.resize((lw, lh), Image.Resampling.LANCZOS), lg["x"], lg["y"], "logo")
+    b = spec.get("badge")
+    if b:
+        im = badge_image(b, W)
+        if im.width > W:
+            im = im.resize((W, round(im.height * W / im.width)), Image.Resampling.LANCZOS)
+        place(im, b["x"], b["y"], "badge")
+    return out
+
+
+def stamp(cmd, spec, W, H, workdir):
+    """Ajoute le texte theme et le logo a une commande ffmpeg de rendu (-vf, ou -filter_complex
+    qui sort [v]). Renvoie (commande, fichiers temporaires)."""
+    layers = stamp_layers(spec, W, H, workdir)
+    if not layers:
+        return cmd, []
+    cmd = list(cmd)
+    if "-vf" in cmd:
+        i = cmd.index("-vf")
+        cmd[i:i + 2] = ["-filter_complex", f"[0:v]{cmd[i + 1]}[v]", "-map", "[v]", "-map", "0:a?"]
+    i = cmd.index("-filter_complex")
+    n = sum(c == "-i" for c in cmd[:i])
+    cmd[i:i] = sum((["-loop", "1", "-i", str(f.resolve())] for f, _, _ in layers), [])
+    i = cmd.index("-filter_complex")
+    g, cur = cmd[i + 1], "v"
+    for j, (_, x, y) in enumerate(layers):
+        g += f";[{cur}][{n + j}:v]overlay={x}:{y}:shortest=1[st{j}]"
+        cur = f"st{j}"
+    cmd[i + 1] = g + f";[{cur}]format=yuv420p[stv]"
+    cmd[cmd.index("[v]")] = "[stv]"
+    return cmd, [f for f, _, _ in layers]
+
+
+def run_stamped(cmd, spec, af, W, H, workdir, **kw):
+    """run() d'un rendu, avec texte theme et logo si le short en a."""
+    cmd, tmp = stamp(cmd, spec, W, H, workdir)
+    try:
+        return run(fold_audio(cmd, af), **kw)
+    finally:
+        for f in tmp:
+            f.unlink(missing_ok=True)
+
+
 def themed_vargs(spec, wins, iw, ih, segs, pre, samples, workdir):
     """Graphe ffmpeg d'un short habille : fond flou, decor, video dans les fenetres,
     avant-plan, animations. Renvoie (entrees en plus, filter_complex)."""
@@ -1784,10 +1968,11 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
         inputs, g, cur, tmp = themed_vargs(spec, wins, iw, ih, segs, pre, samples, out.parent)
         g.append(f"[{cur}]subtitles={subs.name}:fontsdir=fonts,format=yuv420p[v]")
         print(f"    habillage : {spec['theme']} ({len(wins)} fenetre(s))")
-        run(fold_audio(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()), *inputs,
-             "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", *af,
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30",
-             "-c:a", "aac", "-b:a", "128k", str(out.name)], af), cwd=str(out.parent.resolve()))
+        run_stamped(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()), *inputs,
+                     "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", *af,
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30",
+                     "-c:a", "aac", "-b:a", "128k", str(out.name)], spec, af, W, H, out.parent,
+                    cwd=str(out.parent.resolve()))
         check_sync(out)
         subs.unlink(missing_ok=True)
         for p in tmp:
@@ -1848,9 +2033,10 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
                         f"subtitles={subs.name}"]
     print(f"    mise en page : {'ecran partage' if split else 'plein cadre'}")
     # cwd=dossier de sortie pour eviter l'echappement des chemins Windows dans subtitles
-    run(fold_audio(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()),
-         *vargs, *af, "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], af), cwd=str(out.parent.resolve()))
+    run_stamped(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()),
+                 *vargs, *af, "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], spec, af, W, H, out.parent,
+                cwd=str(out.parent.resolve()))
     subs.unlink(missing_ok=True)
     check_sync(out)
     return out
@@ -1863,7 +2049,7 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords=No
     tmp = {}
     for lay in sorted(set(lays)):
         tmp[lay] = out.with_name(f"_{lay}_{out.name}")
-        render_spec(raw, words, {**spec, "layout": lay,
+        render_spec(raw, words, {**spec, "layout": lay, "badge": None, "logo": None,
                                  "keys": [{**k, "layout": lay} for k in spec["keys"]]}, tmp[lay], samples, subwords)
     order = sorted(tmp)
     pieces = []  # (mise en page, debut, fin) en temps du short final, plans voisins fusionnes
@@ -1879,9 +2065,10 @@ def splice_layouts(raw, words, spec, out, samples, cuts, lays, segs, subwords=No
     g = [f"[{order.index(lay)}:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[q{i}]"
          for i, (lay, a, b) in enumerate(pieces)]
     g.append("".join(f"[q{i}]" for i in range(len(pieces))) + f"concat=n={len(pieces)}:v=1:a=0[v]")
-    run(["ffmpeg", "-y", *sum((["-i", str(tmp[k].resolve())] for k in order), []),
-         "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
-         "-preset", "veryfast", "-crf", "20", "-c:a", "copy", str(out.resolve())])
+    W, H, _ = FORMATS[spec["format"]]  # texte theme et logo poses une fois, sur le short recolle
+    run_stamped(["ffmpeg", "-y", *sum((["-i", str(tmp[k].resolve())] for k in order), []),
+                 "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
+                 "-preset", "veryfast", "-crf", "20", "-c:a", "copy", str(out.resolve())], spec, [], W, H, out.parent)
     for p in tmp.values():
         p.unlink(missing_ok=True)
     print(f"    {len(pieces)} passages plein cadre / ecran partage")
