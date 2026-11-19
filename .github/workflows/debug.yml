@@ -1,24 +1,24 @@
 name: debug-synchro
-# temporaire : comprendre pourquoi le son n'est pas coupe sur le serveur (a supprimer)
+# temporaire : verifier la synchro son/image du vrai rendu sur le serveur (a supprimer)
 on: workflow_dispatch
 jobs:
   t:
     runs-on: ubuntu-latest
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu && pip install -q opencv-python-headless numpy pillow
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ffmpeg -version | head -1
-          gh release download job-d8e55c7d3929da3a -R ${{ github.repository }} -p raw_01.mp4
-          SEL="between(t,0.000,7.900)+between(t,9.520,13.480)+between(t,24.300,30.160)"
-          d() { ffprobe -v error -show_entries stream=codec_type,duration,start_time -of csv=p=0 "$1" | tr '\n' ' '; echo; }
-          echo "== brut"; d raw_01.mp4
-          echo "== A graphe commun"
-          ffmpeg -v warning -y -ss 5 -to 40 -i raw_01.mp4 -filter_complex "[0:v]select='$SEL',setpts=N/FRAME_RATE/TB[v];[0:a]aselect='$SEL',asetpts=N/SR/TB[aout]" -map "[v]" -map "[aout]" -c:v libx264 -preset ultrafast -c:a aac a.mp4; d a.mp4
-          echo "== B -af a part"
-          ffmpeg -v warning -y -ss 5 -to 40 -i raw_01.mp4 -filter_complex "[0:v]select='$SEL',setpts=N/FRAME_RATE/TB[v]" -map "[v]" -map 0:a -af "aselect='$SEL',asetpts=N/SR/TB" -c:v libx264 -preset ultrafast -c:a aac b.mp4; d b.mp4
-          echo "== C atrim concat"
-          ffmpeg -v warning -y -ss 5 -to 40 -i raw_01.mp4 -filter_complex "[0:v]select='$SEL',setpts=N/FRAME_RATE/TB[v];[0:a]asplit=3[x0][x1][x2];[x0]atrim=0:7.9,asetpts=PTS-STARTPTS[y0];[x1]atrim=9.52:13.48,asetpts=PTS-STARTPTS[y1];[x2]atrim=24.3:30.16,asetpts=PTS-STARTPTS[y2];[y0][y1][y2]concat=n=3:v=0:a=1[aout]" -map "[v]" -map "[aout]" -c:v libx264 -preset ultrafast -c:a aac c.mp4; d c.mp4
-          echo "== D audio seul"
-          ffmpeg -v warning -y -ss 5 -to 40 -i raw_01.mp4 -vn -af "aselect='$SEL',asetpts=N/SR/TB" -c:a aac d.m4a; d d.m4a
+          gh release download job-d8e55c7d3929da3a -R ${{ github.repository }} -p raw_01.mp4 -p shorts.json
+          python - <<'PY'
+          import json, pathlib, clip
+          m = json.load(open("shorts.json", encoding="utf-8"))[0]
+          words = [{"word": w, "start": a, "end": b} for w, a, b in m["words"]]
+          out = pathlib.Path("t.mp4").resolve()
+          clip.render_spec(pathlib.Path("raw_01.mp4"), words, clip.parse_spec(m["spec"], 109.3), out, None)
+          print("SYNCHRO", clip.check_sync(out))
+          PY

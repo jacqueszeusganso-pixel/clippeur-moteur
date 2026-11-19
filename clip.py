@@ -555,7 +555,8 @@ def transcript_lines(words, group=10):
 
 # Offre gratuite Groq : 8000 jetons par minute, question et reponse comprises. Une demi-heure
 # de parole depasse ca (erreur 413) : on envoie la transcription par tranches.
-CHUNK_CHARS = 11000  # ~3500 jetons de transcription par appel
+CHUNK_CHARS = 11000
+PER_CALL = 6  # extraits demandes au LLM par appel  # ~3500 jetons de transcription par appel
 # Choix de Jacques (2026-11-15) : tout ce qui est publie est en anglais, quelle que soit la
 # langue de la video. Consigne en anglais : en francais, le modele repondait parfois en francais.
 ENGLISH = ("IMPORTANT: write every title, caption and hashtag in ENGLISH, even if the video "
@@ -644,15 +645,24 @@ def select_clips(words, key, n, cat="auto", find="", opts=None):
     opts = opts or parse_opts("{}")
     print("[3/4] choix des meilleurs moments (LLM Groq)...")
     total = int(float(words[-1]["end"]))
-    chunks = chunk_lines(transcript_lines(words))
+    text = transcript_lines(words)
+    # au-dela de 6 extraits par reponse, le modele rend un JSON invalide (erreur 400
+    # json_validate_failed, constate avec 10 le 2026-11-19) : assez de tranches pour 6 chacune
+    k = min(n, PER_CALL)
+    chunks = chunk_lines(text, min(CHUNK_CHARS, len(text) // math.ceil(n / PER_CALL) + 1))
     found = []
     for i, part in enumerate(chunks):
         if len(chunks) > 1:
             print(f"    tranche {i + 1}/{len(chunks)}")
-        try:
-            found += select_in(part, total, key, n, cat, find, len(chunks) > 1, opts)
-        except (urllib.error.URLError, urllib.error.HTTPError, KeyError) as e:
-            print(f"[info] LLM indisponible sur cette tranche ({e})")
+        for ask in (k, max(2, k // 2)):  # reponse invalide : on redemande moins d'extraits
+            try:
+                found += select_in(part, total, key, ask, cat, find, len(chunks) > 1, opts)
+                break
+            except urllib.error.HTTPError as e:
+                print(f"[info] LLM indisponible sur cette tranche ({e}), essai avec moins d'extraits")
+            except (urllib.error.URLError, KeyError) as e:
+                print(f"[info] LLM indisponible sur cette tranche ({e})")
+                break
     if not found:
         print("[info] aucun extrait propose par le LLM, decoupage regulier en secours.")
         found = fallback_clips(total, n, opts["dmax"])
@@ -1677,6 +1687,19 @@ def themed_vargs(spec, wins, iw, ih, segs, pre, samples, workdir):
     return inputs, g, cur, [bg, fg] + [e[0] for e in extras]
 
 
+def audio_cut(segs, s0):
+    """Filtre son qui ne garde que les morceaux parles. atrim + concat et non aselect : sur le
+    ffmpeg 8.0.1 du serveur, aselect ne coupe rien (teste le 2026-11-19 : son 35 s, image 17,8 s ;
+    atrim + concat : 17,72 s). Un seul flux en entree et en sortie : marche en -af comme en graphe."""
+    k = len(segs)
+    cut = [f"atrim={a - s0:.3f}:{b - s0:.3f},asetpts=PTS-STARTPTS" for a, b in segs]
+    if k == 1:
+        return cut[0]
+    return (f"asplit={k}" + "".join(f"[x{i}]" for i in range(k)) + ";"
+            + ";".join(f"[x{i}]{c}[y{i}]" for i, c in enumerate(cut)) + ";"
+            + "".join(f"[y{i}]" for i in range(k)) + f"concat=n={k}:v=0:a=1")
+
+
 def fold_audio(cmd, af):
     """-af a cote de -filter_complex : le ffmpeg 8.0 du serveur l'ignore. Image sans les blancs,
     son entier : la bouche, la voix et les sous-titres se decalent (constate le 2026-11-19).
@@ -1734,7 +1757,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
     if segs != [(s0, s1)]:  # retrait des blancs : on ne garde que les morceaux parles
         sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
         pre = f"select='{sel}',setpts=N/FRAME_RATE/TB,"
-        af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"] if has_audio(raw) else []
+        af = ["-af", audio_cut(segs, s0)] if has_audio(raw) else []
     wins = theme_windows(spec)
     if wins:  # habillage GTA : son propre graphe, le reste de la fonction ne change pas
         th = THEMES[spec["theme"]]
@@ -2011,7 +2034,7 @@ def separate(raw, segs, s0, s1, tmp):
     af = []
     if segs != [(s0, s1)]:
         sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
-        af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
+        af = ["-af", audio_cut(segs, s0)]
     try:
         run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw), "-vn", *af,
              "-ac", "2", "-ar", "44100", str(wav)])
@@ -2530,6 +2553,9 @@ def selfcheck():
     build_ass([], [(0, 2)], pt, title="T", cta="C", top=652)
     assert ",8,90,90,676" in pt.read_text(encoding="utf-8")  # titre juste sous la facecam
     # son coupe dans le meme graphe que l'image (sinon decalage bouche / sous-titres)
+    ac = audio_cut([(5, 7), (9, 10)], 5)
+    assert ac == ("asplit=2[x0][x1];[x0]atrim=0.000:2.000,asetpts=PTS-STARTPTS[y0];"
+                  "[x1]atrim=4.000:5.000,asetpts=PTS-STARTPTS[y1];[y0][y1]concat=n=2:v=0:a=1"), ac
     fc = fold_audio(["ffmpeg", "-filter_complex", "[0:v]null[v]", "-map", "[v]", "-map", "0:a?",
                      "-af", "aselect='x'", "o.mp4"], ["-af", "aselect='x'"])
     assert "-af" not in fc and fc[2].endswith(";[0:a]aselect='x'[aout]") and "[aout]" in fc, fc
