@@ -1677,6 +1677,43 @@ def themed_vargs(spec, wins, iw, ih, segs, pre, samples, workdir):
     return inputs, g, cur, [bg, fg] + [e[0] for e in extras]
 
 
+def fold_audio(cmd, af):
+    """-af a cote de -filter_complex : le ffmpeg 8.0 du serveur l'ignore. Image sans les blancs,
+    son entier : la bouche, la voix et les sous-titres se decalent (constate le 2026-11-19).
+    On met le filtre son dans le graphe, ce que toutes les versions appliquent."""
+    if not af or "-filter_complex" not in cmd:
+        return cmd
+    cmd = list(cmd)
+    i = cmd.index("-filter_complex")
+    cmd[i + 1] += f";[0:a]{af[1]}[aout]"
+    cmd[cmd.index("0:a?")] = "[aout]"
+    k = cmd.index("-af")
+    del cmd[k:k + 2]
+    return cmd
+
+
+def check_sync(out):
+    """Image et son doivent durer pareil : sinon le short est decale, on le dit fort."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
+                        "-of", "csv=p=0", str(out)], capture_output=True, text=True)
+    d = {}
+    for line in r.stdout.split():
+        kind, _, val = line.partition(",")
+        try:
+            d[kind] = float(val)
+        except ValueError:
+            pass
+    if "video" in d and "audio" in d and abs(d["video"] - d["audio"]) > 0.5:
+        print(f"[alerte] {out.name} : image {d['video']:.1f} s, son {d['audio']:.1f} s, short decale")
+    return d
+
+
+def has_audio(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                        "stream=index", "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
 def render_spec(raw, words, spec, out, samples=None, subwords=None):
     """Rend un short a partir de son extrait brut. `words` en temps de l'extrait.
     `subwords` : mots a sous-titrer s'ils different de ceux qu'on entend (voix off)."""
@@ -1697,7 +1734,7 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
     if segs != [(s0, s1)]:  # retrait des blancs : on ne garde que les morceaux parles
         sel = "+".join(f"between(t,{a - s0:.3f},{b - s0:.3f})" for a, b in segs)
         pre = f"select='{sel}',setpts=N/FRAME_RATE/TB,"
-        af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"]
+        af = ["-af", f"aselect='{sel}',asetpts=N/SR/TB"] if has_audio(raw) else []
     wins = theme_windows(spec)
     if wins:  # habillage GTA : son propre graphe, le reste de la fonction ne change pas
         th = THEMES[spec["theme"]]
@@ -1711,10 +1748,11 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
         inputs, g, cur, tmp = themed_vargs(spec, wins, iw, ih, segs, pre, samples, out.parent)
         g.append(f"[{cur}]subtitles={subs.name}:fontsdir=fonts,format=yuv420p[v]")
         print(f"    habillage : {spec['theme']} ({len(wins)} fenetre(s))")
-        run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()), *inputs,
+        run(fold_audio(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()), *inputs,
              "-filter_complex", ";".join(g), "-map", "[v]", "-map", "0:a?", *af,
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30",
-             "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(out.parent.resolve()))
+             "-c:a", "aac", "-b:a", "128k", str(out.name)], af), cwd=str(out.parent.resolve()))
+        check_sync(out)
         subs.unlink(missing_ok=True)
         for p in tmp:
             p.unlink(missing_ok=True)
@@ -1774,10 +1812,11 @@ def render_spec(raw, words, spec, out, samples=None, subwords=None):
                         f"subtitles={subs.name}"]
     print(f"    mise en page : {'ecran partage' if split else 'plein cadre'}")
     # cwd=dossier de sortie pour eviter l'echappement des chemins Windows dans subtitles
-    run(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()),
+    run(fold_audio(["ffmpeg", "-y", "-ss", str(s0), "-to", str(s1), "-i", str(raw.resolve()),
          *vargs, *af, "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], cwd=str(out.parent.resolve()))
+         "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(out.name)], af), cwd=str(out.parent.resolve()))
     subs.unlink(missing_ok=True)
+    check_sync(out)
     return out
 
 
@@ -2490,6 +2529,11 @@ def selfcheck():
     pt = pathlib.Path(tempfile.mkdtemp()) / "t.ass"
     build_ass([], [(0, 2)], pt, title="T", cta="C", top=652)
     assert ",8,90,90,676" in pt.read_text(encoding="utf-8")  # titre juste sous la facecam
+    # son coupe dans le meme graphe que l'image (sinon decalage bouche / sous-titres)
+    fc = fold_audio(["ffmpeg", "-filter_complex", "[0:v]null[v]", "-map", "[v]", "-map", "0:a?",
+                     "-af", "aselect='x'", "o.mp4"], ["-af", "aselect='x'"])
+    assert "-af" not in fc and fc[2].endswith(";[0:a]aselect='x'[aout]") and "[aout]" in fc, fc
+    assert fold_audio(["ffmpeg", "-vf", "null", "-af", "a"], ["-af", "a"]) == ["ffmpeg", "-vf", "null", "-af", "a"]
     print("selfcheck OK")
     return 0
 
