@@ -166,9 +166,14 @@ def parse_opts(raw):
         "voice": d.get("voice") is True,
         "camp": d.get("camp") if d.get("camp") in CAMPAIGNS else "",
         "badge": parse_badge(d.get("badge")), "logo": parse_logo(d.get("logo")),
+        "lang": d.get("lang") if d.get("lang") in LANGS else "en",
+        "mode": "recap" if d.get("mode") == "recap" else "clips",  # moments forts ou resume continu
     }
+    if o["mode"] == "recap":
+        o["hook"] = False  # un resume suit l'ordre de la video : pas de reaction recopiee en tete
     if o["camp"]:
         o["voice"] = False  # les campagnes refusent une voix fabriquee
+        o["lang"] = "en"  # et sont publiees en anglais
     try:
         a, b = int(float(d["dmin"])), int(float(d["dmax"]))
         a, b = max(DUR_MIN, min(a, DUR_MAX)), max(DUR_MIN, min(b, DUR_MAX))
@@ -532,10 +537,10 @@ def transcribe(video, workdir, key):
     print("[2/4] transcription (Whisper Groq)...")
     audio = extract_audio(video, workdir)
     size = audio.stat().st_size
-    words = []
+    words, heard = [], ""
     if size <= AUDIO_CHUNK_BYTES:
         resp = _transcribe_one(audio.read_bytes(), key)
-        words = resp.get("words") or []
+        words, heard = resp.get("words") or [], resp.get("language") or ""
     else:
         dur = ffprobe_duration(audio)
         nchunks = math.ceil(size / AUDIO_CHUNK_BYTES)
@@ -546,6 +551,7 @@ def transcribe(video, workdir, key):
             run(["ffmpeg", "-y", "-ss", str(start), "-t", str(step), "-i", str(audio),
                  "-ac", "1", "-ar", "16000", "-b:a", "64k", str(part)])
             resp = _transcribe_one(part.read_bytes(), key)
+            heard = heard or resp.get("language") or ""
             for w in resp.get("words") or []:
                 w["start"] = float(w.get("start", 0)) + start
                 w["end"] = float(w.get("end", 0)) + start
@@ -553,7 +559,14 @@ def transcribe(video, workdir, key):
     words = [w for w in words if w.get("word") and w.get("end") is not None]
     if not words:
         sys.exit("[erreur] transcription vide (pas de paroles detectees ?)")
-    return words
+    return words, spoken_lang(heard, words)
+
+
+def spoken_lang(heard, words):
+    """Langue entendue par Whisper ("French" ou "fr") -> code ; "" si inconnue."""
+    h = str(heard).strip().lower()
+    code = WHISPER_LANGS.get(h, h if len(h) == 2 else "")
+    return code or ("en" if is_english(words) else "")
 
 
 def transcript_lines(words, group=10):
@@ -571,10 +584,22 @@ def transcript_lines(words, group=10):
 # de parole depasse ca (erreur 413) : on envoie la transcription par tranches.
 CHUNK_CHARS = 11000
 PER_CALL = 6  # extraits demandes au LLM par appel  # ~3500 jetons de transcription par appel
-# Choix de Jacques (2026-11-15) : tout ce qui est publie est en anglais, quelle que soit la
-# langue de la video. Consigne en anglais : en francais, le modele repondait parfois en francais.
-ENGLISH = ("IMPORTANT: write every title, caption and hashtag in ENGLISH, even if the video "
-           "is in French or any other language. Never answer in French.")
+# Langue des shorts (2026-11-24, demande de Jacques : l'outil n'est pas que pour l'anglais) :
+# titres, legendes, hashtags ET sous-titres dans la langue choisie, anglais par defaut. Si la video
+# parle une autre langue, les sous-titres sont traduits. Pour ajouter une langue : une ligne ici,
+# une dans LANGS de site/api/_gh.mjs et une option dans le select #lang du site.
+# Consigne en anglais : en francais, le modele repondait parfois en francais.
+LANGS = {"en": ("ENGLISH", "Part"), "fr": ("FRENCH", "Partie"), "es": ("SPANISH", "Parte")}
+WHISPER_LANGS = {"english": "en", "french": "fr", "spanish": "es"}
+
+
+def lang_rule(lang="en"):
+    name = LANGS.get(lang, LANGS["en"])[0]
+    return (f"IMPORTANT: write every title, caption and hashtag in {name}, whatever the language "
+            f"of the video. Never answer in another language.")
+
+
+ENGLISH = lang_rule("en")
 
 
 def chunk_lines(text, size=CHUNK_CHARS):
@@ -588,16 +613,22 @@ def chunk_lines(text, size=CHUNK_CHARS):
 
 
 def chat_retry(messages, key, tries=4, json_mode=True, extra=None):
-    """groq_chat qui attend la fin de la minute quand le quota par minute est atteint."""
+    """groq_chat qui attend la fin de la minute quand le quota par minute est atteint, et
+    reessaie quand Groq coupe la connexion ou tombe (5xx)."""
     for i in range(tries):
         try:
             return groq_chat(messages, key, json_mode, extra)
         except urllib.error.HTTPError as e:
-            if e.code != 429 or i == tries - 1:
+            if e.code != 429 and e.code < 500 or i == tries - 1:
                 raise
-            wait = min(float(e.headers.get("retry-after") or 30), 90) + 1
-            print(f"[info] quota Groq par minute atteint, pause de {wait:.0f} s")
+            wait = min(float(e.headers.get("retry-after") or 30), 90) + 1 if e.code == 429 else 5
+            print(f"[info] Groq {e.code}, pause de {wait:.0f} s")
             time.sleep(wait)
+        except OSError as e:  # connexion coupee sans reponse (RemoteDisconnected), delai depasse
+            if i == tries - 1:
+                raise urllib.error.URLError(e)
+            print(f"[info] connexion a Groq coupee ({type(e).__name__}), nouvel essai")
+            time.sleep(5)
 
 
 def best_distinct(clips, n):
@@ -720,7 +751,7 @@ def select_in(transcript, total, key, n, cat, find, partial, opts):
         "- il se comprend sans avoir vu le live ni connaitre le contexte ;\n"
         "- le score mesure la chance qu'on le regarde jusqu'au bout : un debut lent, une fin "
         "coupee ou une blague interne font baisser le score.\n"
-        + ENGLISH)
+        + lang_rule(opts["lang"]))
     if opts["loop"]:
         user_msg += ("\n\nLe short sera lu en boucle : apres la chute, si la premiere phrase "
                      "de l'extrait revient juste apres dans la video, arrete-toi juste avant.")
@@ -735,7 +766,7 @@ def select_in(transcript, total, key, n, cat, find, partial, opts):
                      "Ne retiens que des extraits qui y correspondent, du plus probable au "
                      "moins probable (le score dit a quel point ca correspond). S'il n'y a "
                      "pas de correspondance exacte, donne les passages les plus proches.\n"
-                     + ENGLISH)
+                     + lang_rule(opts["lang"]))
     raw = chat_retry([{"role": "system", "content": sys_msg},
                       {"role": "user", "content": user_msg}], key)
     clips = parse_clips(raw, total)
@@ -768,18 +799,14 @@ def parse_clips(raw, total):
             continue
         if not (2 <= end - start <= 120):  # garde-fou duree
             continue
-        tags = c.get("hashtags")
-        if isinstance(tags, str):
-            tags = tags.split()
-        if isinstance(tags, list):  # "#" garanti, espaces internes retires : pret a publier
-            tags = " ".join("#" + re.sub(r"[\s#]+", "", str(t)) for t in tags if str(t).strip("# "))
+        tags = tags_str(c.get("hashtags"))
         out.append({
             "start": start, "end": end,
             "title": str(c.get("title", "Short"))[:80],
             "score": int(c.get("score", 0) or 0),
             "reason": str(c.get("reason", ""))[:200],
             "caption": str(c.get("caption", ""))[:400],
-            "hashtags": str(tags or "")[:300],
+            "hashtags": tags,
             "hook_text": str(c.get("hook_text", ""))[:120],
         })
     out.sort(key=lambda x: x["score"], reverse=True)
@@ -959,6 +986,7 @@ def parse_spec(d, dur):
         "voice": d.get("voice") is True,
         "cta": ass_text(str(d.get("cta") or ""))[:80],
         "badge": parse_badge(d.get("badge")), "logo": parse_logo(d.get("logo")),
+        "lang": d.get("lang") if d.get("lang") in LANGS else "en",
         **{k: ass_text(str(d.get(k) or ""))[:n] for k, n in TEXTS.items()},
     }
 
@@ -1044,7 +1072,7 @@ def base_spec(samples, opts, iw, ih, s0, s1, title, box=None):
         "cut": opts["cut"], "subs": True, "title": title, "ask": "",
         "color": ACCENT, "subc": "#FFFFFF", "keys": [], "voice": opts.get("voice", False),
         "cta": CAMPAIGNS[opts["camp"]]["cta"] if opts.get("camp") else "",
-        "badge": opts.get("badge"), "logo": opts.get("logo"),
+        "badge": opts.get("badge"), "logo": opts.get("logo"), "lang": opts.get("lang", "en"),
     }
 
 
@@ -2265,15 +2293,15 @@ def style_ref(vocals, heard, segs, tmp, length=14.0):
     return out
 
 
-def voice_over(raw, words, spec, out, samples=None, key=None):
+def voice_over(raw, words, spec, out, samples=None, key=None, subwords=None):
     """render_spec, avec la voix off de Jacques si spec["voice"]. Sans voix ou en cas de
     souci (echantillon absent, Chatterbox pas installe), le short sort sans voix off."""
     ref = os.environ.get("VOICE_REF", "")
     if not spec.get("voice"):
-        return render_spec(raw, words, spec, out, samples)
+        return render_spec(raw, words, spec, out, samples, subwords)
     if not (key and ref and pathlib.Path(ref).exists()):
         print("[info] voix off demandee mais echantillon ou cle absents : short sans voix off")
-        return render_spec(raw, words, spec, out, samples)
+        return render_spec(raw, words, spec, out, samples, subwords)
     s0, s1 = spec["trim"]
     segs = keep_segments(words, s0, s1) if spec["cut"] else [(s0, s1)]
     dur = sum(b - a for a, b in segs)
@@ -2313,7 +2341,7 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
     except (Exception, SystemExit) as e:  # la voix off ne doit jamais faire perdre le short (run -> sys.exit)
         print(f"[info] voix off abandonnee ({type(e).__name__}: {e})")
         clean_tmp(tmp)
-        return render_spec(raw, words, spec, out, samples)
+        return render_spec(raw, words, spec, out, samples, subwords)
     render_spec(raw, words, spec, out, samples, subwords=said or None)
     mixed = out.with_name(f"_mix_{out.name}")
     if bed:  # bruits du jeu sous la voix off : forts entre les phrases, effaces quand elle parle
@@ -2327,6 +2355,291 @@ def voice_over(raw, words, spec, out, samples=None, key=None):
              "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(mixed)])
     mixed.replace(out)
     clean_tmp(tmp)
+    return out
+
+
+# ----------------------------------------------------------------------------- sous-titres traduits
+
+def phrases(words, maxw=14, gap=.5):
+    """Mots -> phrases entendues (coupees sur une pause, une ponctuation finale ou 14 mots)."""
+    out, cur = [], []
+    for w in words:
+        if cur and (len(cur) >= maxw or float(w["start"]) - float(cur[-1]["end"]) > gap
+                    or float(w["start"]) < float(cur[-1]["start"]) or re.search(r"[.!?]$", cur[-1]["word"].strip())):
+            out.append(cur)
+            cur = []
+        cur.append(w)
+    return out + [cur] if cur else out
+
+
+def spread(text, a, b):
+    """Mots d'une phrase traduite repartis sur [a, b] au prorata de leur longueur."""
+    toks = text.split()
+    wt = [len(t) + 2 for t in toks]
+    tot, cum, out = sum(wt), 0, []
+    for t, k in zip(toks, wt):
+        out.append({"word": t, "start": round(a + (b - a) * cum / tot, 2),
+                    "end": round(a + (b - a) * (cum + k) / tot, 2)})
+        cum += k
+    return out
+
+
+def translate_words(words, lang, heard, key, batch=40):
+    """Sous-titres dans la langue choisie quand la video en parle une autre : chaque phrase est
+    traduite, puis ses mots sont repartis sur le temps de la phrase (les blancs coupes ne bougent
+    pas : une phrase ne chevauche jamais une pause). None si rien a traduire ou en cas d'echec."""
+    if not words or not key or heard == lang:
+        return None
+    name = LANGS[lang][0].capitalize()
+    groups, out = phrases(words), []
+    for i in range(0, len(groups), batch):
+        part = groups[i:i + batch]
+        rows = "\n".join(f"{j + 1}. " + " ".join(w["word"].strip() for w in g) for j, g in enumerate(part))
+        try:
+            raw = chat_retry([{"role": "system", "content": "You translate video subtitles."},
+                              {"role": "user", "content":
+                               f"Translate each numbered subtitle line into natural spoken {name}. The lines "
+                               "follow each other in the video. Keep the meaning and the tone (slang, jokes, "
+                               "swearing), keep names, add nothing, no emoji. If a line is already in "
+                               f"{name}, copy it. Answer with exactly {len(part)} lines and nothing else, each "
+                               f"starting with its number: \"1. ...\", \"2. ...\".\n\n{rows}"}],
+                             key, json_mode=False, extra={"reasoning_effort": "low", "max_completion_tokens": 6000})
+            lines = parse_lines(raw, len(part))
+        except Exception as e:  # sous-titres d'origine plutot que pas de short
+            print(f"[info] traduction des sous-titres impossible ({type(e).__name__}), sous-titres d'origine")
+            return None
+        for g, line in zip(part, lines):
+            if line:
+                out += spread(line, float(g[0]["start"]), max(float(w["end"]) for w in g))
+            else:
+                out += [{"word": w["word"].strip(), "start": w["start"], "end": w["end"]} for w in g]
+    return out
+
+
+# ----------------------------------------------------------------------------- mode resume
+# Demande de Jacques (2026-11-24) : en plus des moments forts, un resume de la video en un seul
+# short (ou plusieurs parties a la suite pour une longue video), qui raconte l'histoire en continu :
+# accroche, contexte, montee, moment fort, chute. Passages de la video mis bout a bout, dans l'ordre.
+RECAP_CHARS = 14000  # au-dela, on resume d'abord la transcription en temps forts (quota Groq par minute)
+SENT_END = re.compile(r"[.!?…][\"'»)]*$")  # mot qui finit une phrase
+
+
+def tags_str(tags):
+    """Hashtags du LLM -> "#a #b" ("#" garanti, espaces internes retires : pret a publier)."""
+    if isinstance(tags, str):
+        tags = tags.split()
+    if not isinstance(tags, list):
+        return ""
+    return " ".join("#" + re.sub(r"[\s#]+", "", str(t)) for t in tags if str(t).strip("# "))[:300]
+
+
+def json_reply(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
+
+
+def chapter_bounds(words, n):
+    """Video coupee en n chapitres de meme longueur, chaque coupe sur la plus longue pause proche."""
+    total = float(words[-1]["end"])
+    cuts = [0.0]
+    for k in range(1, n):
+        t = total * k / n
+        gaps = [(float(b["start"]) - float(a["end"]), (float(a["end"]) + float(b["start"])) / 2)
+                for a, b in zip(words, words[1:]) if abs(float(a["end"]) - t) < 60]
+        cuts.append(max(gaps)[1] if gaps else t)
+    return list(zip(cuts, cuts[1:] + [total + 1]))
+
+
+def recap_text(ws, key):
+    """Ce que le LLM lit pour monter le resume : la transcription, ou ses temps forts si trop longue."""
+    text = transcript_lines(ws, 14)
+    if len(text) <= RECAP_CHARS:
+        return text, False
+    beats = []
+    for i, part in enumerate(chunk_lines(text)):
+        print(f"    temps forts, tranche {i + 1}")
+        msg = (f"Voici un passage de la transcription horodatee d'une video. Chaque ligne commence par son "
+               f"temps de debut en secondes.\n\n{part}\n\nReleve dans l'ordre les temps forts de l'histoire : "
+               "ce qui se passe, les revelations, les rebondissements, les phrases cles. Reponds STRICTEMENT en "
+               'JSON : {"beats":[{"start":<secondes>,"end":<secondes>,"what":"<ce qui se passe, 1 phrase>"}]} '
+               "avec 6 a 15 temps forts de 5 a 25 s, start et end pris dans la transcription.")
+        try:
+            for b in json_reply(chat_retry([{"role": "user", "content": msg}], key)).get("beats") or []:
+                beats.append(f"[{int(float(b['start']))}-{int(float(b['end']))}s] {str(b['what'])[:160]}")
+        except (urllib.error.URLError, KeyError, TypeError, ValueError, AttributeError) as e:
+            print(f"[info] temps forts indisponibles sur cette tranche ({e})")
+    return ("\n".join(beats), True) if beats else (text[:RECAP_CHARS], False)
+
+
+def plan_recap(ws, key, opts, i, n, a, b):
+    """Le LLM choisit les passages du resume d'un chapitre. None si la reponse est inexploitable."""
+    text, beats = recap_text(ws, key)
+    dmin, dmax = opts["dmin"], opts["dmax"]
+    where = (f" (chapitre {i + 1} sur {n} : la video est coupee en {n} chapitres qui se suivent, celui-ci va "
+             f"de {int(a)} s a {int(b)} s ; le resume ne couvre que ce chapitre"
+             + (" et donne envie de voir la suite)" if i + 1 < n else ")")) if n > 1 else ""
+    src = ("Voici les temps forts d'une video, avec leurs horaires en secondes (pas la transcription complete)"
+           if beats else "Voici la transcription horodatee d'une video. Chaque ligne commence par son temps "
+                         "de debut en secondes")
+    msg = (
+        f"{src}{where}.\n\n{text}\n\n"
+        f"Monte UN resume vertical de {dmin} a {dmax} secondes (duree totale) qui raconte cette video en "
+        "continu, comme si le spectateur la regardait en accelere sans jamais perdre le fil. Le resume est "
+        "fait de passages de la video mis bout a bout. Reponds STRICTEMENT en JSON :\n"
+        '{"title":"<titre accrocheur, max 60 caracteres>","score":<chance qu on le regarde jusqu au bout, 0-100>,'
+        '"reason":"<pourquoi ca tient, 1 phrase>","caption":"<legende de post, 1-2 phrases accrocheuses>",'
+        '"hashtags":["<4 a 6 hashtags pertinents>"],"parts":[{"start":<secondes>,"end":<secondes>}]}\n'
+        "Regles :\n"
+        "- 4 a 10 passages, dans l'ordre de la video, sans chevauchement, start et end pris dans la video ;\n"
+        "- chaque passage est une idee complete de 3 a 20 s : il commence au debut d'une phrase et finit a "
+        "la fin d'une phrase ;\n"
+        "- le premier passage accroche des la premiere seconde : il pose l'enjeu ou une question qu'on veut "
+        "voir resolue, jamais une salutation ni une introduction ;\n"
+        "- mis bout a bout, les passages se comprennent sans avoir vu la video : le contexte utile, la "
+        "montee, le moment fort, puis la chute ;\n"
+        "- garde les moments forts, les rebondissements et les phrases qui retiennent l'attention ; ecarte "
+        "les repetitions, digressions, pubs, remerciements et temps morts ;\n"
+        "- le dernier passage conclut : la chute, la revelation ou la reponse a l'accroche ;\n"
+        f"- la somme des durees des passages est entre {dmin} et {dmax} secondes.\n"
+        "Sans aucun emoji. Rien d'autre que le JSON.\n" + lang_rule(opts["lang"]))
+    if CATS.get(opts["cat"]):
+        msg += "\n\nContexte : " + CATS[opts["cat"]]
+    if opts["find"]:
+        msg += "\n\nLe spectateur veut surtout voir : « " + opts["find"] + " ». Centre le resume dessus."
+    d = json_reply(chat_retry([{"role": "system", "content": "Tu es un monteur expert en resumes video pour "
+                                                            "TikTok, Reels et YouTube Shorts."},
+                               {"role": "user", "content": msg}], key))
+    parts = []
+    for p in d.get("parts") or [] if isinstance(d, dict) else []:
+        try:
+            s, e = float(p["start"]), float(p["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if a - 2 <= s < e <= b + 2 and e - s >= 1:
+            parts.append((s, e))
+    if not parts:
+        return None
+    return {"title": str(d.get("title") or "Recap")[:80], "score": int(d.get("score") or 0),
+            "reason": str(d.get("reason") or "")[:200], "caption": str(d.get("caption") or "")[:400],
+            "hashtags": tags_str(d.get("hashtags")), "hook_text": "", "parts": parts}
+
+
+def fallback_recap(ws, opts, k=5):
+    """Secours si le LLM echoue : k passages repartis regulierement sur le chapitre."""
+    a, b = float(ws[0]["start"]), float(ws[-1]["end"])
+    ln = (opts["dmin"] + opts["dmax"]) / 2 / k
+    step = max(ln, (b - a - ln) / max(k - 1, 1))
+    parts = [(a + j * step, a + j * step + ln) for j in range(k) if a + j * step + ln <= b + 1]
+    return {"title": "Recap", "score": 50, "reason": "decoupage regulier (IA indisponible)",
+            "caption": "", "hashtags": "", "hook_text": "", "parts": parts or [(a, min(b, a + ln * k))]}
+
+
+def fit_parts(parts, words, opts, a, b):
+    """Cale chaque passage sur les mots (fin de phrase : jusqu'a la pause suivante, 3 s max), recolle
+    les passages qui se touchent, puis tient la duree totale dans [dmin, dmax]."""
+    cut = opts["cut"]
+    ws_all = [w for w in words if a <= float(w["start"]) < b]
+
+    def stop(j):  # le mot j termine une phrase (ponctuation de Whisper, sinon une vraie pause)
+        w = ws_all[j]
+        return (j + 1 >= len(ws_all) or bool(SENT_END.search(w["word"].strip()))
+                or float(ws_all[j + 1]["start"]) - float(w["end"]) > .5)
+    out = []
+    for s, e in sorted(parts):
+        lo = out[-1][1] if out else a
+        idx = [j for j, w in enumerate(ws_all) if float(w["start"]) >= max(s - .3, lo) and float(w["end"]) <= e + .3]
+        if not idx:
+            continue
+        i0 = idx[0]  # debut : recule jusqu'au debut de la phrase (5 s max)
+        for k in range(idx[0], -1, -1):
+            if float(ws_all[idx[0]]["start"]) - float(ws_all[k]["start"]) > 5 or float(ws_all[k]["start"]) < lo:
+                break
+            if k == 0 or stop(k - 1):
+                i0 = k
+                break
+        j = idx[-1]  # fin : avance jusqu'a la fin de la phrase (6 s max), sinon recule sur la derniere finie
+        while not stop(j) and float(ws_all[j + 1]["end"]) - e < 6:
+            j += 1
+        if not stop(j):
+            j = next((k for k in range(idx[-1], i0, -1) if stop(k)), j)
+        start = max(lo, float(ws_all[i0]["start"]) - .05)
+        end = float(ws_all[j]["end"]) + .08
+        if j + 1 < len(ws_all):
+            end = min(end, float(ws_all[j + 1]["start"]))
+        if out and start - out[-1][1] < .3:
+            out[-1][1] = end  # passages qui se suivent : un seul, pas de coupe inutile
+        elif end - start >= 1:
+            out.append([start, end])
+
+    def total():
+        return sum(kept(words, x, y, cut) for x, y in out)
+    while len(out) > 2 and total() > opts["dmax"]:  # trop long : on retire le passage du milieu le plus adapte
+        extra = total() - opts["dmax"]
+        drop = min(range(1, len(out) - 1), key=lambda i: (kept(words, *out[i], cut) < extra,
+                                                           abs(kept(words, *out[i], cut) - extra)))
+        out.pop(drop)
+    for whole in (True, False):  # encore trop long : la fin du dernier passage recule de phrase en phrase,
+        x = out[-1] if out else None  # puis de mot en mot si une phrase ne suffit pas
+        if not x or total() <= opts["dmax"]:
+            break
+        for k in reversed([k for k, w in enumerate(ws_all) if x[0] < float(w["start"]) < x[1]]):
+            if whole and not stop(k):
+                continue
+            x[1] = float(ws_all[k]["end"]) + .08
+            if total() <= opts["dmax"] or x[1] - x[0] < 3:
+                break
+    if out and total() < opts["dmin"]:  # trop court : le dernier passage continue, phrase par phrase
+        x = out[-1]
+        for k in [k for k, w in enumerate(ws_all) if float(w["start"]) >= x[1]]:
+            x[1] = float(ws_all[k]["end"]) + .08
+            if stop(k) and total() >= opts["dmin"]:
+                break
+    return [(round(max(0.0, x), 2), round(y, 2)) for x, y in out]
+
+
+def select_recaps(words, key, n, opts):
+    """n resumes : un par chapitre de la video (n = 1 : toute la video en un seul short)."""
+    print("[3/4] montage du resume (LLM Groq)...")
+    total = float(words[-1]["end"])
+    n = max(1, min(n, int(total // (2 * opts["dmin"])) or 1))  # chaque chapitre doit pouvoir nourrir un resume
+    out = []
+    for i, (a, b) in enumerate(chapter_bounds(words, n)):
+        ws = [w for w in words if a <= float(w["start"]) < b]
+        if not ws:
+            continue
+        if n > 1:
+            print(f"    chapitre {i + 1}/{n} : {a:.0f}-{min(b, total):.0f} s")
+        rc = None
+        try:
+            rc = plan_recap(ws, key, opts, i, n, a, b)
+        except (urllib.error.URLError, KeyError, TypeError, ValueError, AttributeError) as e:
+            print(f"[info] LLM indisponible pour ce resume ({e})")
+        if not rc:
+            print("[info] resume de secours : passages repartis regulierement")
+            rc = fallback_recap(ws, opts)
+        parts = fit_parts(rc["parts"], words, opts, a, b)
+        if not parts:
+            continue
+        title = rc["title"]
+        if n > 1:
+            title = f"{title[:60]} ({LANGS[opts['lang']][1]} {i + 1}/{n})"
+        out.append({**rc, "title": title, "start": parts[0][0], "end": parts[-1][1], "parts": parts})
+        print(f"    {len(parts)} passages, {sum(kept(words, x, y, opts['cut']) for x, y in parts):.0f} s : {title}")
+    return out
+
+
+def shift_parts(words, parts):
+    """Mots de la source -> temps dans le resume monte (meme ordre que concat_parts)."""
+    out, off = [], 0.0
+    for a, b in parts:
+        for w in words:
+            if float(w["start"]) >= a - .02 and float(w["end"]) <= b + .02:
+                out.append({"word": w["word"].strip(), "start": round(max(0.0, float(w["start"]) - a) + off, 2),
+                            "end": round(min(float(w["end"]), b) - a + off, 2)})
+        off += b - a
     return out
 
 
@@ -2353,7 +2666,15 @@ def hook_span(words, clip):
 def hook_raw(video, raw, r0, s, hook, r1):
     """Extrait brut avec la reaction recopiee juste avant le debut du short :
     [marge avant] + [reaction] + [le short et la marge apres]. False si ffmpeg echoue."""
-    parts = [p for p in ((r0, s), hook, (s, r1)) if p[1] - p[0] > .05]
+    ok = concat_parts(video, raw, [(r0, s), hook, (s, r1)])
+    if not ok:
+        print("[info] ouverture sur la reaction impossible (pas de piste son ?), extrait normal")
+    return ok
+
+
+def concat_parts(video, raw, parts):
+    """Passages de la source mis bout a bout (coupes exactes, reencodes). False si ffmpeg echoue."""
+    parts = [p for p in parts if p[1] - p[0] > .05]
     cmd = ["ffmpeg", "-y"]
     for a, b in parts:
         cmd += ["-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", str(video.resolve())]
@@ -2361,10 +2682,7 @@ def hook_raw(video, raw, r0, s, hook, r1):
     g += "".join(f"[v{i}][a{i}]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=1[v][a]"
     cmd += ["-filter_complex", g, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
             "-crf", "21", "-r", "30", "-c:a", "aac", "-b:a", "160k", str(raw)]
-    ok = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode == 0
-    if not ok:
-        print("[info] ouverture sur la reaction impossible (pas de piste son ?), extrait normal")
-    return ok
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode == 0
 
 
 def shift_words(words, r0, s, hook, r1):
@@ -2391,19 +2709,30 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
         clip = {**clip, "hashtags": " ".join(need + have)}
     name = f"short_{index:02d}_{clip['score']:03d}_{slugify(clip['title'])}"
     total = total or ffprobe_duration(video)
-    r0, r1 = max(0.0, clip["start"] - EDGE), min(total, clip["end"] + EDGE)
     raw = workdir / f"raw_{index:02d}.mp4"
-    hook = hook_span(words, clip) if opts["hook"] else None
-    if hook and not hook_raw(video, raw, r0, clip["start"], hook, r1):
-        hook = None
-    if not hook:
-        # extrait reencode (coupe exacte) : c'est lui que l'editeur montre et recadre
-        run(["ffmpeg", "-y", "-ss", str(r0), "-to", str(r1), "-i", str(video.resolve()),
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "160k",
-             str(raw)])
-    rel = shift_words(words, r0, clip["start"], hook, r1)
-    T = hook[1] - hook[0] if hook else 0.0
-    s0, s1 = clip["start"] - r0, clip["end"] - r0 + T
+    hook, T = None, 0.0
+    if clip.get("parts"):  # resume : les passages mis bout a bout forment l'extrait brut
+        if not concat_parts(video, raw, clip["parts"]):
+            sys.exit("[erreur] montage du resume impossible (ffmpeg)")
+        r0, r1 = 0.0, sum(b - a for a, b in clip["parts"])
+        rel = shift_parts(words, clip["parts"])
+        s0, s1 = 0.0, r1
+    else:
+        r0, r1 = max(0.0, clip["start"] - EDGE), min(total, clip["end"] + EDGE)
+        hook = hook_span(words, clip) if opts["hook"] else None
+        if hook and not hook_raw(video, raw, r0, clip["start"], hook, r1):
+            hook = None
+        if not hook:
+            # extrait reencode (coupe exacte) : c'est lui que l'editeur montre et recadre
+            run(["ffmpeg", "-y", "-ss", str(r0), "-to", str(r1), "-i", str(video.resolve()),
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "160k",
+                 str(raw)])
+        rel = shift_words(words, r0, clip["start"], hook, r1)
+        T = hook[1] - hook[0] if hook else 0.0
+        s0, s1 = clip["start"] - r0, clip["end"] - r0 + T
+    subw = translate_words(rel, opts["lang"], opts.get("heard", ""), key)
+    if subw:
+        print(f"    sous-titres traduits ({opts.get('heard') or '?'} -> {opts['lang']})")
     if hook:
         print(f"    ouverture sur la reaction : {hook[0]:.1f}-{hook[1]:.1f} s repris en tete")
     samples = face_samples(raw, s0, s1) if use_face else []
@@ -2420,14 +2749,15 @@ def render_clip(video, words, clip, workdir, index, iw, ih, use_face=True, opts=
     if opts["layout"] == "auto" and spec["layout"] == "full" and spec["theme"] != "versus":
         # pas de facecam de streamer : le realisateur choisit plein cadre ou partage plan par plan
         spec = apply_director(spec, director(raw, s0, s1, iw, ih, spec))
-    out = voice_over(raw, rel, spec, workdir / f"{name}.mp4", samples, key)
+    out = voice_over(raw, rel, spec, workdir / f"{name}.mp4", samples, key, subw)
     # pack de publication, pret a copier-coller
     tags = clip.get("hashtags", "")
     (workdir / f"{name}.txt").write_text(
         f"{clip['title']}\n\n{clip.get('caption', '')}\n\n{tags}\n", encoding="utf-8")
     return {**clip, "file": out.name, "raw": raw.name, "dur": round(r1 - r0 + T, 2), "spec": spec,
             "hook": list(hook) if hook else None,
-            "words": [[w["word"], w["start"], w["end"]] for w in rel]}
+            "words": [[w["word"], w["start"], w["end"]] for w in rel],
+            **({"subwords": [[w["word"], w["start"], w["end"]] for w in subw]} if subw else {})}
 
 
 def ask_edit(spec, words, dur, key):
@@ -2440,7 +2770,7 @@ def ask_edit(spec, words, dur, key):
         f"Demande du monteur : \u00ab {spec['ask']} \u00bb\n\n"
         'Reponds STRICTEMENT en JSON : {"changes": {...}} avec seulement les cles a modifier '
         "parmi trim, title, cut, subs, format (9:16, 4:5, 1:1, 16:9) et layout (full ou split). "
-        "Sans emoji.\n" + ENGLISH)
+        "Sans emoji.\n" + lang_rule(spec.get("lang", "en")))
     try:
         raw = groq_chat([{"role": "system", "content": "Tu es monteur de shorts. Tu ne reponds qu'en JSON."},
                          {"role": "user", "content": msg}], key)
@@ -2473,7 +2803,8 @@ def edit_main(args):
     if spec["track"] and spec["layout"] == "full" and not spec["keys"]:
         samples = face_samples(raw, *spec["trim"])
     out = pathlib.Path(args.edit_out)
-    voice_over(raw, words, spec, out, samples, load_groq_key() if spec["voice"] else None)
+    subw = [{"word": w, "start": a, "end": b} for w, a, b in entry.get("subwords") or []] or None
+    voice_over(raw, words, spec, out, samples, load_groq_key() if spec["voice"] else None, subw)
     spec["ask"] = ""
     out.with_suffix(".json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     print(f"Edition prete : {out}")
@@ -2534,8 +2865,12 @@ def main():
              "-i", str(video), "-c", "copy", str(part)])
         video = part
 
-    words = transcribe(video, workdir, key)
-    clips = select_clips(words, key, args.clips, opts["cat"], opts["find"], opts)
+    words, opts["heard"] = transcribe(video, workdir, key)
+    print(f"    langue entendue : {opts['heard'] or 'inconnue'} ; shorts en : {opts['lang']}")
+    if opts["mode"] == "recap":
+        clips = select_recaps(words, key, args.clips, opts)
+    else:
+        clips = select_clips(words, key, args.clips, opts["cat"], opts["find"], opts)
     iw, ih = video_dims(video)
     print(f"[4/4] rendu de {len(clips)} short(s)...")
 
@@ -2768,6 +3103,32 @@ def selfcheck():
     moving = [(i * .5, .2 + (i % 3) * .3, .4, .1) for i in range(10)]  # visages du jeu qui bougent
     assert plan_layout(moving, parse_opts("{}"), 1920, 1080, (.7, .4, .3, .3)) == "split"
     assert in_box((0, .85, .6, .05), CAMPAIGNS["tomo"]["box"]) and not in_box((0, .3, .4, .1), CAMPAIGNS["tomo"]["box"])
+    # langue et mode resume (2026-11-24)
+    o = parse_opts('{"lang":"fr","mode":"recap"}')
+    assert o["lang"] == "fr" and o["mode"] == "recap" and o["hook"] is False
+    assert parse_opts('{"lang":"xx"}')["lang"] == "en" and parse_opts("{}")["mode"] == "clips"
+    assert parse_opts('{"lang":"fr","camp":"tomo"}')["lang"] == "en"
+    assert "FRENCH" in lang_rule("fr") and "ENGLISH" in lang_rule("zz")
+    assert spoken_lang("French", []) == "fr" and spoken_lang("es", []) == "es"
+    assert parse_spec({"lang": "es"}, 9)["lang"] == "es" and parse_spec({}, 9)["lang"] == "en"
+    ws = [{"word": f"w{i}", "start": i * .4, "end": i * .4 + .3} for i in range(400)]  # 160 s de parole continue
+    ws[50]["word"] = "fin."
+    assert [len(g) for g in phrases(ws[:60])][:4] == [14, 14, 14, 9]  # 14 mots max, coupe apres "fin."
+    sp = spread("un deux trois", 10, 13)
+    assert sp[0]["start"] == 10 and sp[-1]["end"] == 13 and all(a["end"] == b["start"] for a, b in zip(sp, sp[1:]))
+    assert translate_words(ws, "fr", "fr", "k") is None  # meme langue : rien a traduire
+    ro = {**parse_opts('{"mode":"recap","dmin":40,"dmax":60,"cut":false}')}
+    fp = fit_parts([(0, 10), (10.1, 20), (50, 70), (90, 100), (120, 140)], ws, ro, 0, 161)
+    tot = sum(b - a for a, b in fp)
+    assert 40 <= tot <= 60 + .5 and all(b <= c for (_, b), (c, _) in zip(fp, fp[1:])), (fp, tot)
+    assert fp[0][0] < 1 and len(fp) >= 2  # (0,10) et (10.1,20) recolles en un seul passage
+    fp = fit_parts([(0, 8)], ws, ro, 0, 161)
+    assert sum(b - a for a, b in fp) >= 40, fp  # trop court : prolonge jusqu'a la duree mini
+    sh = shift_parts(ws, [(0, 2), (10, 12)])
+    assert sh[0]["start"] == 0 and min(w["start"] for w in sh if w["word"] == "w25") == 2.0, sh[:8]
+    cb = chapter_bounds(ws, 2)
+    assert len(cb) == 2 and 20 < cb[0][1] < 140 and cb[1][0] == cb[0][1]
+    assert tags_str(["a", "#b c"]) == "#a #bc" and tags_str("x y") == "#x #y" and tags_str(None) == ""
     print("selfcheck OK")
     return 0
 
