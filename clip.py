@@ -655,6 +655,7 @@ def fit_clip(clip, words, opts):
     (pas de blanc) et, mieux, celui ou le mot suivant est le premier mot du short :
     la derniere image s'enchaine sur la premiere."""
     dmin, dmax, cut = opts["dmin"], opts["dmax"], opts["cut"]
+    allw = words
     ws = [w for w in words if float(w["end"]) > clip["start"] - .3]
     if not ws:
         return clip
@@ -681,9 +682,32 @@ def fit_clip(clip, words, opts):
     if best is None:  # pas assez de parole : on garde ce qui rentre, au plus pres de dmax
         last = [w for w in ws if kept(words, start, float(w["end"]) + .08, cut) <= dmax]
         best = (float((last or ws)[-1]["end"]), None)
+        start = pull_start(allw, start, best[0] + .08, opts)
     e, nxt = best
     end = e + .08 if not nxt else min(e + .08, float(nxt["start"]))
     return {**clip, "start": round(start, 2), "end": round(end, 2)}
+
+
+def pull_start(words, start, end, opts):
+    """Pas assez de parole apres le debut (fin de la video, longs silences) : le debut recule de
+    phrase en phrase jusqu'a la duree mini, sans depasser la duree maxi (2026-11-24 : un short de
+    33 s pour 40 s demandees, l'extrait commencait 36 s avant la fin de la video)."""
+    dmin, dmax, cut = opts["dmin"], opts["dmax"], opts["cut"]
+    if kept(words, start, end, cut) >= dmin:
+        return start
+    before = [w for w in words if float(w["end"]) <= start + .1]
+    best = start
+    for k in range(len(before) - 1, -1, -1):
+        s = max(0.0, float(before[k]["start"]) - .05)
+        d = kept(words, s, end, cut)
+        if d > dmax:
+            break
+        head = k == 0 or SENT_END.search(before[k - 1]["word"].strip()) or             float(before[k]["start"]) - float(before[k - 1]["end"]) > .5  # debut de phrase
+        if head:
+            best = s
+            if d >= dmin:
+                break
+    return best
 
 
 def select_clips(words, key, n, cat="auto", find="", opts=None):
@@ -3128,6 +3152,11 @@ def selfcheck():
     assert sh[0]["start"] == 0 and min(w["start"] for w in sh if w["word"] == "w25") == 2.0, sh[:8]
     cb = chapter_bounds(ws, 2)
     assert len(cb) == 2 and 20 < cb[0][1] < 140 and cb[1][0] == cb[0][1]
+    # fin de video : le debut recule pour atteindre la duree mini
+    tail = [{"word": ("fin." if i % 10 == 9 else f"m{i}"), "start": i * .4, "end": i * .4 + .3} for i in range(200)]
+    fc = fit_clip({"start": 70.0, "end": 80.0, "title": "t", "score": 1}, tail, {**ro, "loop": False})
+    d = fc["end"] - fc["start"]
+    assert 40 <= d <= 60 and fc["end"] > 79 and tail[int(fc["start"] / .4 + .5) - 1]["word"] == "fin.", fc
     assert tags_str(["a", "#b c"]) == "#a #bc" and tags_str("x y") == "#x #y" and tags_str(None) == ""
     print("selfcheck OK")
     return 0
